@@ -4,13 +4,14 @@ use clap::Parser;
 use glob::*;
 use log::*;
 use log4rs::append::console::ConsoleAppender;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -109,6 +110,17 @@ impl ExifAttr {
 			None => ExifAttr::Nothing,
 		}
 	}
+
+	fn from_opt_filetime(from: Option<std::time::SystemTime>) -> ExifAttr {
+		match from
+			.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+			.and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos()))
+			.map(|dt| dt.naive_utc())
+		{
+			Some(t) => ExifAttr::Timestamp(t),
+			None => ExifAttr::Nothing,
+		}
+	}
 }
 
 impl App {
@@ -123,13 +135,22 @@ impl App {
 		return Ok(out);
 	}
 
-	pub fn extract_props(&self, path: &PathBuf) -> HashMap<String, ExifAttr> {
-		let mut out = HashMap::new();
-		out.insert("_ext".to_owned(), ExifAttr::from_opt_str(path.extension().map(OsStr::to_str).flatten()));
-		out.insert("_name".to_owned(), ExifAttr::from_opt_str(path.file_stem().map(OsStr::to_str).flatten()));
-		out.insert("_fullName".to_owned(), ExifAttr::from_opt_str(path.file_name().map(OsStr::to_str).flatten()));
-		out.insert("_path".to_owned(), ExifAttr::from_opt_path(path.parent()));
+	pub fn extract_props(&self, path: &PathBuf) -> BTreeMap<String, ExifAttr> {
+		let mut out = BTreeMap::new();
+		out.insert("fs.Ext".to_owned(), ExifAttr::from_opt_str(path.extension().map(OsStr::to_str).flatten()));
+		out.insert("fs.Name".to_owned(), ExifAttr::from_opt_str(path.file_stem().map(OsStr::to_str).flatten()));
+		out.insert("fs.FullName".to_owned(), ExifAttr::from_opt_str(path.file_name().map(OsStr::to_str).flatten()));
+		out.insert("fs.Path".to_owned(), ExifAttr::from_opt_path(path.parent()));
 
+		match fs::metadata(path) {
+			Ok(metadata) => {
+				out.insert("fs.DateTimeCreated".to_owned(), ExifAttr::from_opt_filetime(metadata.created().ok()));
+				out.insert("fs.DateTimeModified".to_owned(), ExifAttr::from_opt_filetime(metadata.modified().ok()));
+				out.insert("fs.DateTimeAccessed".to_owned(), ExifAttr::from_opt_filetime(metadata.accessed().ok()));
+				out.insert("fs.FileSize".to_owned(), ExifAttr::Integer(metadata.len() as i64));
+			}
+			Err(err) => error!("Unable to read metadata for {:?}: {:?}", path, err),
+		}
 		let exif_file = fs::File::open(path);
 		match exif_file {
 			Ok(file) => {
@@ -137,8 +158,13 @@ impl App {
 				let exifreader = exif::Reader::new();
 				if let Ok(exif) = exifreader.read_from_container(&mut bufreader) {
 					for f in exif.fields() {
-						// println!("{} {} {:.50}", f.tag, f.ifd_num,
-						// f.display_value().with_unit(&exif).to_string());
+						info!(
+							"{:30} {:50} {:10} {:.50}",
+							f.tag,
+							f.tag.description().unwrap_or(""),
+							f.ifd_num,
+							f.display_value().with_unit(&exif).to_string()
+						);
 						let value = match f.value {
 							exif::Value::Byte(ref n) => ExifAttr::from_opt_integer(n.first()),
 							exif::Value::Ascii(ref text) => {
@@ -154,7 +180,7 @@ impl App {
 							exif::Value::Long(ref n) => ExifAttr::from_opt_integer(n.first()),
 							exif::Value::Rational(ref r) => ExifAttr::from_opt_rational(r.first()),
 							exif::Value::SByte(ref n) => ExifAttr::from_opt_integer(n.first()),
-							exif::Value::Undefined(_, _) => ExifAttr::Nothing,
+							exif::Value::Undefined(_, _) => ExifAttr::Text(f.display_value().to_string()),
 							exif::Value::SShort(ref n) => ExifAttr::from_opt_integer(n.first()),
 							exif::Value::SLong(ref n) => ExifAttr::from_opt_integer(n.first()),
 							exif::Value::SRational(ref r) => ExifAttr::from_opt_rational(r.first()),
@@ -162,7 +188,7 @@ impl App {
 							exif::Value::Double(ref v) => ExifAttr::from_opt_real(v.first()),
 							exif::Value::Unknown(_, _, _) => ExifAttr::Nothing,
 						};
-						out.insert(f.tag.to_string(), value);
+						out.insert(format!("{}.{}", f.ifd_num, f.tag), value);
 					}
 				}
 			}
