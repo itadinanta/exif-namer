@@ -3,11 +3,11 @@ use chrono::NaiveDateTime;
 use clap::Parser;
 use exif::In;
 use glob::*;
+use handlebars_misc_helpers::{env_helpers, path_helpers, regex_helpers, string_helpers};
 use log::*;
 use log4rs::append::console::ConsoleAppender;
 use serde_json::value::*;
 use sha1::{Digest, Sha1};
-use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 use std::io;
@@ -20,19 +20,25 @@ use std::time::UNIX_EPOCH;
 #[command(version, about, long_about = None)]
 struct Args {
 	#[arg()]
-	globs: Vec<String>,
-
-	#[arg(short, long, default_value = "%Y%m%d_%H%M%S")]
-	date_time_format: String,
+	sources: Vec<String>,
 
 	#[arg(short, long, default_value = "{{SysPath}}/{{SysName}}_{{SysSha1}}.{{SysExt}}")]
-	out: String,
+	destination: String,
+
+	#[arg(short, long, default_value = "%Y%m%d_%H%M%S")]
+	timestamp_format: String,
 
 	#[arg(short, long, default_value_t = false)]
 	verbose: bool,
 
-	#[arg(short='n', long, default_value_t = false)]
+	#[arg(short = 'n', long, default_value_t = false)]
 	dry_run: bool,
+
+	#[arg(short, long, default_value_t = false)]
+	info: bool,
+
+	#[arg(short, long, default_value_t = 100)]
+	max_display_len: usize,
 
 	#[arg(short, long, default_value = "[^\\w\\+\\-]+")]
 	sanitize: String,
@@ -42,7 +48,7 @@ struct Args {
 }
 
 #[derive(Clone, Debug)]
-enum ExifAttr {
+enum PropertyValue {
 	Text(String),
 	Path(PathBuf),
 	Timestamp(NaiveDateTime),
@@ -64,47 +70,47 @@ impl Pair<i32> for exif::SRational {
 	fn as_pair(&self) -> (i32, i32) { (self.num, self.denom) }
 }
 
-impl ExifAttr {
+impl PropertyValue {
 	fn from_opt_str(from: Option<&str>) -> Self {
 		match from {
-			Some(word) => ExifAttr::Text(String::from(word)),
-			None => ExifAttr::Nothing,
+			Some(word) => PropertyValue::Text(String::from(word)),
+			None => PropertyValue::Nothing,
 		}
 	}
 
 	fn from_opt_str_datetime(from: Option<&str>) -> Self {
 		match from {
 			Some(word) => match NaiveDateTime::parse_from_str(word, "%Y:%m:%d %H:%M:%S") {
-				Ok(dt) => ExifAttr::Timestamp(dt),
+				Ok(dt) => PropertyValue::Timestamp(dt),
 				Err(e) => {
 					warn!("Unable to parse '{}' as date: {:?}", word, e);
-					ExifAttr::Text(String::from(word))
+					PropertyValue::Text(String::from(word))
 				}
 			},
-			None => ExifAttr::Nothing,
+			None => PropertyValue::Nothing,
 		}
 	}
 
 	fn from_opt_path(from: Option<&Path>) -> Self {
 		match from {
-			Some(dir) => ExifAttr::Path(PathBuf::from(dir)),
-			None => ExifAttr::Nothing,
+			Some(dir) => PropertyValue::Path(PathBuf::from(dir)),
+			None => PropertyValue::Nothing,
 		}
 	}
 
 	fn from_opt_integer<T>(from: Option<&T>) -> Self
 	where T: Into<i64> + Copy {
 		match from {
-			Some(n) => ExifAttr::Integer((*n).into()),
-			None => ExifAttr::Nothing,
+			Some(n) => PropertyValue::Integer((*n).into()),
+			None => PropertyValue::Nothing,
 		}
 	}
 
 	fn from_opt_real<T>(from: Option<&T>) -> Self
 	where T: Into<f64> + Copy {
 		match from {
-			Some(v) => ExifAttr::Real((*v).into()),
-			None => ExifAttr::Nothing,
+			Some(v) => PropertyValue::Real((*v).into()),
+			None => PropertyValue::Nothing,
 		}
 	}
 
@@ -115,20 +121,20 @@ impl ExifAttr {
 		match from {
 			Some(r) => {
 				let (n, d) = r.as_pair();
-				ExifAttr::Fraction(n.into(), d.into())
+				PropertyValue::Fraction(n.into(), d.into())
 			}
-			None => ExifAttr::Nothing,
+			None => PropertyValue::Nothing,
 		}
 	}
 
-	fn from_opt_filetime(from: Option<std::time::SystemTime>) -> ExifAttr {
+	fn from_opt_filetime(from: Option<std::time::SystemTime>) -> PropertyValue {
 		match from
 			.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
 			.and_then(|d| DateTime::from_timestamp(d.as_secs() as i64, d.subsec_nanos()))
 			.map(|dt| dt.naive_utc())
 		{
-			Some(t) => ExifAttr::Timestamp(t),
-			None => ExifAttr::Nothing,
+			Some(t) => PropertyValue::Timestamp(t),
+			None => PropertyValue::Nothing,
 		}
 	}
 }
@@ -154,17 +160,18 @@ impl ExifAttrFormatter {
 		})
 	}
 
-	fn fmt<W>(&self, value: &ExifAttr, f: &mut W) -> std::fmt::Result
+	fn fmt<W>(&self, value: &PropertyValue, f: &mut W) -> std::fmt::Result
 	where W: Write {
 		match value {
 			// write!(f, "{}", strings)
-			ExifAttr::Text(ref text) => f.write_str(text),
-			ExifAttr::Path(ref path) => f.write_str(path.to_str().unwrap_or("")),
-			ExifAttr::Timestamp(ref timestamp) => f.write_str(&timestamp.format(&self.date_time_format).to_string()),
-			ExifAttr::Integer(ref value) => write!(f, "{}", value),
-			ExifAttr::Fraction(ref num, ref den) => write!(f, "{}_{}", num, den),
-			ExifAttr::Real(ref value) => write!(f, "{}", value),
-			ExifAttr::Nothing => Ok(()),
+			PropertyValue::Text(ref text) => f.write_str(text),
+			PropertyValue::Path(ref path) => f.write_str(path.to_str().unwrap_or("")),
+			PropertyValue::Timestamp(ref timestamp) =>
+				f.write_str(&timestamp.format(&self.date_time_format).to_string()),
+			PropertyValue::Integer(ref value) => write!(f, "{}", value),
+			PropertyValue::Fraction(ref num, ref den) => write!(f, "{}_{}", num, den),
+			PropertyValue::Real(ref value) => write!(f, "{}", value),
+			PropertyValue::Nothing => Ok(()),
 		}
 	}
 
@@ -174,21 +181,22 @@ impl ExifAttrFormatter {
 
 	pub fn sanitize_key(&self, key: &String) -> String { self.sanitize_key_pattern.replace_all(key, "").to_string() }
 
-	pub fn as_string(&self, value: &ExifAttr) -> String {
+	pub fn as_string(&self, value: &PropertyValue) -> String {
 		let mut value_as_string = String::new();
 		if let Err(e) = self.fmt(&value, &mut value_as_string) {
 			error!("Cannot convert {:?} to string: {}", value, e)
 		}
 		match value {
-			ExifAttr::Path(_) => value_as_string,
+			PropertyValue::Path(_) => value_as_string,
 			_ => self.sanitize_value(&value_as_string),
 		}
 	}
 }
 
-struct App {
+struct App<'a> {
 	args: Args,
-	fmt: ExifAttrFormatter,
+	attr_formatter: ExifAttrFormatter,
+	handlebars: handlebars::Handlebars<'a>,
 }
 
 macro_rules! sys_prefix {
@@ -199,15 +207,27 @@ macro_rules! sys_prefix {
 
 macro_rules! with_sys_prefix {
 	($name:expr) => {
-		concat!(sys_prefix!(), $name).to_owned()
+		concat!(sys_prefix!(), $name)
 	};
 }
 
-impl App {
-	fn new(args: Args) -> Result<Self, regex::Error> {
-		let fmt = ExifAttrFormatter::new(args.date_time_format.clone(), &args.sanitize, args.replacement.clone())?;
+const DESTINATION_TEMPLATE_ID: &'static str = "destination";
 
-		Ok(App { args, fmt })
+impl<'a> App<'a> {
+	fn new(args: Args) -> Result<Self, regex::Error> {
+		let attr_formatter =
+			ExifAttrFormatter::new(args.timestamp_format.clone(), &args.sanitize, args.replacement.clone())?;
+		let mut handlebars = handlebars::Handlebars::new();
+		string_helpers::register(&mut handlebars);
+		regex_helpers::register(&mut handlebars);
+		path_helpers::register(&mut handlebars);
+		regex_helpers::register(&mut handlebars);
+		env_helpers::register(&mut handlebars);
+		handlebars
+			.register_template_string(DESTINATION_TEMPLATE_ID, &args.destination)
+			.map_err(|e| regex::Error::Syntax(format!("Handlebar syntax error in {}: {}", args.destination, e)))?;
+
+		Ok(App { args, attr_formatter, handlebars })
 	}
 
 	fn find_matches(&self, pattern: &str) -> Result<Vec<PathBuf>, PatternError> {
@@ -221,57 +241,74 @@ impl App {
 		return Ok(out);
 	}
 
-	fn extract_props(&self, path: &PathBuf) -> BTreeMap<String, ExifAttr> {
-		let mut out = BTreeMap::new();
-		out.insert(
+	fn extract_properties<F>(&self, src: &PathBuf, mut add_property: F)
+	where F: FnMut(&str, &PropertyValue) {
+		// Path properties
+		add_property(
 			with_sys_prefix!("Ext"),
-			ExifAttr::from_opt_path(path.extension().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
+			&PropertyValue::from_opt_path(src.extension().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
 		);
-		out.insert(
+		add_property(
 			with_sys_prefix!("Name"),
-			ExifAttr::from_opt_path(path.file_stem().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
+			&PropertyValue::from_opt_path(src.file_stem().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
 		);
-		out.insert(
+		add_property(
 			with_sys_prefix!("FullName"),
-			ExifAttr::from_opt_path(path.file_name().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
+			&PropertyValue::from_opt_path(src.file_name().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
 		);
-		out.insert(with_sys_prefix!("Path"), ExifAttr::from_opt_path(path.parent()));
-		let mut r_path = PathBuf::new();
-		let components = path.components().collect::<Vec<_>>();
+		add_property(with_sys_prefix!("Path"), &PropertyValue::from_opt_path(src.parent()));
+		let mut partial_path = PathBuf::new();
+		let components = src.components().collect::<Vec<_>>();
 		let n_components = components.len();
 		for (i, component) in components.iter().enumerate() {
-			out.insert(
-				format!(concat!(sys_prefix!(), "PathElem{}"), i),
-				ExifAttr::from_opt_path(Some(PathBuf::from(component.as_os_str()).as_path())),
+			add_property(
+				&format!(concat!(sys_prefix!(), "PathElem{}"), i),
+				&PropertyValue::from_opt_path(Some(PathBuf::from(component.as_os_str()).as_path())),
 			);
-			r_path.push(component);
-			out.insert(format!(concat!(sys_prefix!(), "Path{}"), i), ExifAttr::from_opt_path(Some(r_path.as_path())));
-			out.insert(
-				format!(concat!(sys_prefix!(), "RPath{}"), n_components - i - 1),
-				ExifAttr::from_opt_path(Some(r_path.as_path())),
+			partial_path.push(component);
+			add_property(
+				&format!(concat!(sys_prefix!(), "Path{}"), i),
+				&PropertyValue::from_opt_path(Some(partial_path.as_path())),
 			);
-		}
-		match fs::metadata(path) {
-			Ok(metadata) => {
-				out.insert(with_sys_prefix!("DateTimeCreated"), ExifAttr::from_opt_filetime(metadata.created().ok()));
-				out.insert(with_sys_prefix!("DateTimeModified"), ExifAttr::from_opt_filetime(metadata.modified().ok()));
-				out.insert(with_sys_prefix!("DateTimeAccessed"), ExifAttr::from_opt_filetime(metadata.accessed().ok()));
-				out.insert(with_sys_prefix!("Size"), ExifAttr::Integer(metadata.len() as i64));
-			}
-			Err(err) => error!("Unable to read metadata for {:?}: {:?}", path, err),
+			add_property(
+				&format!(concat!(sys_prefix!(), "RPath{}"), n_components - i - 1),
+				&PropertyValue::from_opt_path(Some(partial_path.as_path())),
+			);
 		}
 
-		if let Ok(mut file) = fs::File::open(&path) {
+		// Filesystem metadata properties
+		match fs::metadata(src) {
+			Ok(metadata) => {
+				add_property(
+					with_sys_prefix!("DateTimeCreated"),
+					&PropertyValue::from_opt_filetime(metadata.created().ok()),
+				);
+				add_property(
+					with_sys_prefix!("DateTimeModified"),
+					&PropertyValue::from_opt_filetime(metadata.modified().ok()),
+				);
+				add_property(
+					with_sys_prefix!("DateTimeAccessed"),
+					&PropertyValue::from_opt_filetime(metadata.accessed().ok()),
+				);
+				add_property(with_sys_prefix!("Size"), &PropertyValue::Integer(metadata.len() as i64));
+			}
+			Err(e) => error!("Unable to read fs metadata for {:?}: {}", src, e),
+		}
+
+		// File content - Sha1 properties
+		if let Ok(mut file) = fs::File::open(&src) {
 			let mut hasher = Sha1::new();
 			match io::copy(&mut file, &mut hasher) {
 				Ok(_) => {
-					out.insert(with_sys_prefix!("Sha1"), ExifAttr::Text(hex::encode(hasher.finalize())));
+					add_property(&with_sys_prefix!("Sha1"), &PropertyValue::Text(hex::encode(hasher.finalize())));
 				}
-				Err(e) => error!("Unable to compute hash for {:?}: {:?}", &path, e),
+				Err(e) => error!("Unable to compute hash for {:?}: {}", &src, e),
 			}
 		}
 
-		let exif_file = fs::File::open(path);
+		// File content - Exif properties
+		let exif_file = fs::File::open(src);
 		match exif_file {
 			Ok(file) => {
 				let mut buf_reader = io::BufReader::new(&file);
@@ -286,64 +323,75 @@ impl App {
 							f.display_value().with_unit(&exif).to_string()
 						);
 						let value = match f.value {
-							exif::Value::Byte(ref n) => ExifAttr::from_opt_integer(n.first()),
+							exif::Value::Byte(ref n) => PropertyValue::from_opt_integer(n.first()),
 							exif::Value::Ascii(ref text) => {
 								let src = text.first().map(|v| std::str::from_utf8(&*v)).and_then(Result::ok);
 								match f.tag {
 									exif::Tag::DateTime
 									| exif::Tag::DateTimeOriginal
-									| exif::Tag::DateTimeDigitized => ExifAttr::from_opt_str_datetime(src),
-									_ => ExifAttr::from_opt_str(src),
+									| exif::Tag::DateTimeDigitized => PropertyValue::from_opt_str_datetime(src),
+									_ => PropertyValue::from_opt_str(src),
 								}
 							}
-							exif::Value::Short(ref n) => ExifAttr::from_opt_integer(n.first()),
-							exif::Value::Long(ref n) => ExifAttr::from_opt_integer(n.first()),
-							exif::Value::Rational(ref r) => ExifAttr::from_opt_rational(r.first()),
-							exif::Value::SByte(ref n) => ExifAttr::from_opt_integer(n.first()),
-							exif::Value::Undefined(_, _) => ExifAttr::Text(f.display_value().to_string()),
-							exif::Value::SShort(ref n) => ExifAttr::from_opt_integer(n.first()),
-							exif::Value::SLong(ref n) => ExifAttr::from_opt_integer(n.first()),
-							exif::Value::SRational(ref r) => ExifAttr::from_opt_rational(r.first()),
-							exif::Value::Float(ref v) => ExifAttr::from_opt_real(v.first()),
-							exif::Value::Double(ref v) => ExifAttr::from_opt_real(v.first()),
-							exif::Value::Unknown(_, _, _) => ExifAttr::Nothing,
+							exif::Value::Short(ref n) => PropertyValue::from_opt_integer(n.first()),
+							exif::Value::Long(ref n) => PropertyValue::from_opt_integer(n.first()),
+							exif::Value::Rational(ref r) => PropertyValue::from_opt_rational(r.first()),
+							exif::Value::SByte(ref n) => PropertyValue::from_opt_integer(n.first()),
+							exif::Value::Undefined(_, _) => PropertyValue::Text(f.display_value().to_string()),
+							exif::Value::SShort(ref n) => PropertyValue::from_opt_integer(n.first()),
+							exif::Value::SLong(ref n) => PropertyValue::from_opt_integer(n.first()),
+							exif::Value::SRational(ref r) => PropertyValue::from_opt_rational(r.first()),
+							exif::Value::Float(ref v) => PropertyValue::from_opt_real(v.first()),
+							exif::Value::Double(ref v) => PropertyValue::from_opt_real(v.first()),
+							exif::Value::Unknown(_, _, _) => PropertyValue::Nothing,
 						};
 						let key = match f.ifd_num {
 							In::THUMBNAIL => format!("Tn{}", f.tag),
 							_ => f.tag.to_string(),
 						};
-						out.insert(self.fmt.sanitize_key(&key), value);
+						add_property(&self.attr_formatter.sanitize_key(&key), &value);
 					}
 				}
 			}
-			Err(err) => error!("Unable to read EXIF from {:?}: {:?}", path, err),
+			Err(e) => error!("Unable to read EXIF from {:?}: {}", src, e),
 		}
-		out
 	}
 
 	fn run(&self) {
-		for glob in &self.args.globs {
+		// iterate through all globs
+		for glob in &self.args.sources {
 			info!("Matching pattern '{}'", glob);
 			let paths = self.find_matches(glob).expect("Error extracting source files");
 
-			let reg = handlebars::Handlebars::new();
-
-			for src_path in &paths {
-				let props = self.extract_props(src_path);
+			for src_path in paths.iter().filter(|f| f.is_file()) {
 				let mut data = serde_json::value::Map::new();
-				for (key, value) in &props {
-					let value_as_string = self.fmt.as_string(&value);
-					if self.args.verbose {
-						info!("{:50} '{}'", key, value_as_string);
-					}
+				self.extract_properties(src_path, |key, value| {
+					let value_as_string = self.attr_formatter.as_string(value);
 					data.insert(key.to_owned(), Value::String(value_as_string));
+				});
+				if self.args.info {
+					for (key, value) in &data {
+						let value_as_str = value.as_str().expect("The data table should only contain strings");
+						let len = value_as_str.len();
+						if self.args.max_display_len > 0 && len > self.args.max_display_len {
+							println!(
+								"{{{{{}}}}} \"{} ... {}\" ({} chars total)",
+								key,
+								&value_as_str[..self.args.max_display_len / 2],
+								&value_as_str[len - self.args.max_display_len / 2..],
+								len
+							);
+						} else {
+							println!("{{{{{}}}}} \"{}\"", key, value_as_str);
+						}
+					}
 				}
-				match reg.render_template(&self.args.out, &data) {
+				match self.handlebars.render(DESTINATION_TEMPLATE_ID, &data) {
 					Ok(dest) => {
 						let dest_path = PathBuf::from(dest);
 						println!("{:?} {:?}", src_path, dest_path);
 					}
-					Err(e) => error!("Invalid pattern or data {}: {}", &self.args.out, e),
+					Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
 				}
 			}
 		}
