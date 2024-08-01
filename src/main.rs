@@ -1,49 +1,106 @@
-use chrono::DateTime;
-use chrono::NaiveDateTime;
-use clap::Parser;
+use std::fmt::Write;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use chrono::{DateTime, NaiveDateTime};
+use clap::builder::PossibleValue;
+use clap::{Parser, ValueEnum};
 use exif::In;
 use glob::*;
 use handlebars_misc_helpers::{env_helpers, path_helpers, regex_helpers, string_helpers};
 use log::*;
-use log4rs::append::console::ConsoleAppender;
+use log4rs::append::console::{ConsoleAppender, Target};
 use serde_json::value::*;
 use sha1::{Digest, Sha1};
-use std::fmt::Write;
-use std::fs;
-use std::io;
-use std::path::Path;
-use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
 
-/// Simple program to greet a person
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+enum Mode {
+	Move,
+	Copy,
+	SoftLink,
+	HardLink,
+	Info,
+}
+
+impl Default for Mode {
+	fn default() -> Self { Self::Move }
+}
+
+impl std::fmt::Display for Mode {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.to_possible_value().expect("no values are skipped").get_name().fmt(f)
+	}
+}
+
+impl ValueEnum for Mode {
+	fn value_variants<'a>() -> &'a [Self] { &[Self::Move, Self::Copy, Self::SoftLink, Self::HardLink, Self::Info] }
+
+	fn to_possible_value(&self) -> Option<PossibleValue> {
+		Some(match self {
+			Self::Info => PossibleValue::new("info"),
+			Self::Copy => PossibleValue::new("copy"),
+			Self::Move => PossibleValue::new("move"),
+			Self::SoftLink => PossibleValue::new("soft_link"),
+			Self::HardLink => PossibleValue::new("hard_link"),
+		})
+	}
+}
+
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Bulk rename large collections of images using Exif and OS data in the destination names")]
 struct Args {
-	#[arg()]
+	#[arg(help = "A list of glob patterns, each identifying a set of files to inspect and rename")]
 	sources: Vec<String>,
 
-	#[arg(short, long, default_value = "{{SysPath}}/{{SysName}}_{{SysSha1}}.{{SysExt}}")]
+	#[arg(
+		short,
+		long,
+		default_value = "{{SysPath}}/{{SysIdx}}_{{SysName}}.{{SysExt}}",
+		help = "Destination string template. Uses Handlebars syntax",
+		long_help = "Properties are populated by inspecting the source file. \
+			Use -m info for details of properties available for each source file"
+	)]
 	destination: String,
 
-	#[arg(short, long, default_value = "%Y%m%d_%H%M%S")]
+	#[arg(short, long, default_value_t=Mode::Move)]
+	mode: Mode,
+
+	#[arg(
+		short,
+		long,
+		default_value = "%Y%m%d_%H%M%S",
+		help = "Format string for datetime type properties. Uses chrono and POSIX date syntax"
+	)]
 	timestamp_format: String,
 
-	#[arg(short, long, default_value_t = false)]
+	#[arg(short, long, default_value_t = false, help = "Log more debugging information.")]
 	verbose: bool,
 
-	#[arg(short = 'n', long, default_value_t = false)]
+	#[arg(short = 'n', long, default_value_t = false, help = "Do not apply any changes to the filesystem")]
 	dry_run: bool,
 
-	#[arg(short, long, default_value_t = false)]
-	info: bool,
+	#[arg(short, long, default_value_t = false, help = "Force overwrite if destination file exists")]
+	force: bool,
 
-	#[arg(short, long, default_value_t = 100)]
+	#[arg(long, default_value_t = 100, help = "Truncate long values in -m info. Set to 0 for infinite length")]
 	max_display_len: usize,
 
-	#[arg(short, long, default_value = "[^\\w\\+\\-]+")]
-	sanitize: String,
+	#[arg(long, default_value_t = 0, help = "Index counter start")]
+	idx_start: usize,
 
-	#[arg(short, long, default_value = "_")]
+	#[arg(long, default_value_t = 6, help = "Width of zero-padding for index counter")]
+	idx_width: usize,
+
+	#[arg(
+		long,
+		default_value = "[^\\w\\+\\-]+",
+		help = "Regex pattern which identifies invalid characters or sequences in properties"
+	)]
+	invalid_characters: String,
+
+	#[arg(long, default_value = "_", help = "Replacement for invalid characters or sequences in properties")]
 	replacement: String,
 }
 
@@ -216,7 +273,7 @@ const DESTINATION_TEMPLATE_ID: &'static str = "destination";
 impl<'a> App<'a> {
 	fn new(args: Args) -> Result<Self, regex::Error> {
 		let attr_formatter =
-			ExifAttrFormatter::new(args.timestamp_format.clone(), &args.sanitize, args.replacement.clone())?;
+			ExifAttrFormatter::new(args.timestamp_format.clone(), &args.invalid_characters, args.replacement.clone())?;
 		let mut handlebars = handlebars::Handlebars::new();
 		string_helpers::register(&mut handlebars);
 		regex_helpers::register(&mut handlebars);
@@ -256,8 +313,9 @@ impl<'a> App<'a> {
 			with_sys_prefix!("FullName"),
 			&PropertyValue::from_opt_path(src.file_name().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
 		);
-		add_property(with_sys_prefix!("Path"), &PropertyValue::from_opt_path(src.parent()));
-		let mut partial_path = PathBuf::new();
+		let parent = src.parent();
+		add_property(with_sys_prefix!("Path"), &PropertyValue::from_opt_path(parent));
+		let mut path_head = PathBuf::new();
 		let components = src.components().collect::<Vec<_>>();
 		let n_components = components.len();
 		for (i, component) in components.iter().enumerate() {
@@ -265,15 +323,25 @@ impl<'a> App<'a> {
 				&format!(concat!(sys_prefix!(), "PathElem{}"), i),
 				&PropertyValue::from_opt_path(Some(PathBuf::from(component.as_os_str()).as_path())),
 			);
-			partial_path.push(component);
+			path_head.push(component);
 			add_property(
-				&format!(concat!(sys_prefix!(), "Path{}"), i),
-				&PropertyValue::from_opt_path(Some(partial_path.as_path())),
+				&format!(concat!(sys_prefix!(), "PathUp{}"), n_components - i - 1),
+				&PropertyValue::from_opt_path(Some(path_head.as_path())),
 			);
 			add_property(
-				&format!(concat!(sys_prefix!(), "RPath{}"), n_components - i - 1),
-				&PropertyValue::from_opt_path(Some(partial_path.as_path())),
+				&format!(concat!(sys_prefix!(), "PathHead{}"), i),
+				&PropertyValue::from_opt_path(Some(path_head.as_path())),
 			);
+		}
+		if let Some(up) = parent {
+			let mut path_tail = up.components();
+			for i in 0..(n_components - 1) {
+				add_property(
+					&format!(concat!(sys_prefix!(), "PathTail{}"), i),
+					&PropertyValue::from_opt_path(Some(path_tail.as_path())),
+				);
+				path_tail.next();
+			}
 		}
 
 		// Filesystem metadata properties
@@ -358,42 +426,103 @@ impl<'a> App<'a> {
 	}
 
 	fn run(&self) {
+		let mut idx_counter: usize = self.args.idx_start;
 		// iterate through all globs
 		for glob in &self.args.sources {
-			info!("Matching pattern '{}'", glob);
+			debug!("Matching pattern '{}'", glob);
 			let paths = self.find_matches(glob).expect("Error extracting source files");
 
+			// for each file matching the current glob
 			for src_path in paths.iter().filter(|f| f.is_file()) {
+				// extract properties as a String -> Value map
 				let mut data = serde_json::value::Map::new();
 				self.extract_properties(src_path, |key, value| {
 					let value_as_string = self.attr_formatter.as_string(value);
 					data.insert(key.to_owned(), Value::String(value_as_string));
 				});
-				if self.args.info {
-					for (key, value) in &data {
-						let value_as_str = value.as_str().expect("The data table should only contain strings");
-						let len = value_as_str.len();
-						if self.args.max_display_len > 0 && len > self.args.max_display_len {
-							println!(
-								"{{{{{}}}}} \"{} ... {}\" ({} chars total)",
-								key,
-								&value_as_str[..self.args.max_display_len / 2],
-								&value_as_str[len - self.args.max_display_len / 2..],
-								len
-							);
-						} else {
-							println!("{{{{{}}}}} \"{}\"", key, value_as_str);
-						}
-					}
-				}
+				data.insert(
+					with_sys_prefix!("Idx").to_string(),
+					Value::String(format!("{:01$}", idx_counter, self.args.idx_width)),
+				);
+				idx_counter += 1;
+
 				match self.handlebars.render(DESTINATION_TEMPLATE_ID, &data) {
 					Ok(dest) => {
 						let dest_path = PathBuf::from(dest);
-						println!("{:?} {:?}", src_path, dest_path);
+						self.apply_mode(self.args.mode, src_path, &dest_path, &data);
 					}
 					Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
 				}
 			}
+		}
+	}
+
+	fn apply_mode(&self, mode: Mode, src: &PathBuf, dest: &PathBuf, data: &Map<String, Value>) {
+		println!("{:?} {:?} {:?}", mode, src, dest);
+
+		if self.args.mode != Mode::Info {
+			if src == dest {
+				warn!("Source and destination file are the same, skipping");
+				return;
+			}
+
+			if dest.exists() && !self.args.force {
+				warn!("Destination file exists, skipping. Use --force to overwrite");
+				return;
+			}
+
+			if self.args.dry_run {
+				debug!("Dry run mode, will not make any filesystem change");
+				return;
+			}
+
+			if let Some(parent) = dest.parent() {
+				if !parent.exists() {
+					if let Err(e) = fs::create_dir_all(parent) {
+						error!("Could not create containing directory {:?}: {}", parent, e);
+						return;
+					}
+				}
+			}
+		}
+
+		#[allow(deprecated)]
+		match self.args.mode {
+			Mode::Move =>
+				if let Err(e) = fs::rename(src, dest) {
+					error!("Could not rename {:?}: {}", src, e);
+				},
+			Mode::Copy =>
+				if let Err(e) = fs::copy(src, dest) {
+					error!("Could not copy {:?}: {}", src, e);
+				},
+			Mode::SoftLink =>
+				if let Err(e) = fs::soft_link(src, dest) {
+					// this is deprecated but we are sure we are linking files rather than
+					// directories, so there is no need to call the os-dependent version
+					error!("Could not symlink {:?}: {}", src, e);
+				},
+			Mode::HardLink =>
+				if let Err(e) = fs::hard_link(src, dest) {
+					error!("Could not hard link {:?}: {}", src, e);
+				},
+			// if "-m info" is enabled, display the data contained in the properties table
+			Mode::Info =>
+				for (key, value) in data {
+					let value_as_str = value.as_str().expect("The data table should only contain strings");
+					let len = value_as_str.len();
+					if self.args.max_display_len > 0 && len > self.args.max_display_len {
+						println!(
+							"{{{{{}}}}} \"{} ... {}\" ({} chars total)",
+							key,
+							&value_as_str[..self.args.max_display_len / 2],
+							&value_as_str[len - self.args.max_display_len / 2..],
+							len
+						);
+					} else {
+						println!("{{{{{}}}}} \"{}\"", key, value_as_str);
+					}
+				},
 		}
 	}
 }
@@ -401,7 +530,8 @@ impl<'a> App<'a> {
 fn main() {
 	use log4rs::config::*;
 
-	let log_appender = Appender::builder().build("stdout".to_string(), Box::new(ConsoleAppender::builder().build()));
+	let log_appender = Appender::builder()
+		.build("stdout".to_string(), Box::new(ConsoleAppender::builder().target(Target::Stderr).build()));
 	let log_root = Root::builder().appender("stdout".to_string()).build(LevelFilter::Info);
 	let log_config = Config::builder().appender(log_appender).build(log_root);
 
