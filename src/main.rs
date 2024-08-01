@@ -1,6 +1,7 @@
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use clap::Parser;
+use exif::In;
 use glob::*;
 use log::*;
 use log4rs::append::console::ConsoleAppender;
@@ -24,11 +25,14 @@ struct Args {
 	#[arg(short, long, default_value = "%Y%m%d_%H%M%S")]
 	date_time_format: String,
 
-	#[arg(short, long, default_value = "{{sys.Path}}/{{sys.Name}}_{{sys.Sha1}}.{{sys.Ext}}")]
+	#[arg(short, long, default_value = "{{SysPath}}/{{SysName}}_{{SysSha1}}.{{SysExt}}")]
 	out: String,
 
 	#[arg(short, long, default_value_t = false)]
 	verbose: bool,
+
+	#[arg(short='n', long, default_value_t = false)]
+	dry_run: bool,
 
 	#[arg(short, long, default_value = "[^\\w\\+\\-]+")]
 	sanitize: String,
@@ -131,7 +135,8 @@ impl ExifAttr {
 
 struct ExifAttrFormatter {
 	date_time_format: String,
-	sanitize_pattern: regex::Regex,
+	sanitize_key_pattern: regex::Regex,
+	sanitize_value_pattern: regex::Regex,
 	sanitize_replacement: String,
 }
 
@@ -143,7 +148,8 @@ impl ExifAttrFormatter {
 	) -> Result<Self, regex::Error> {
 		Ok(ExifAttrFormatter {
 			date_time_format,
-			sanitize_pattern: regex::Regex::new(sanitize_pattern)?,
+			sanitize_key_pattern: regex::Regex::new("\\W+")?,
+			sanitize_value_pattern: regex::Regex::new(sanitize_pattern)?,
 			sanitize_replacement,
 		})
 	}
@@ -162,9 +168,11 @@ impl ExifAttrFormatter {
 		}
 	}
 
-	fn sanitize(&self, value: &String) -> String {
-		self.sanitize_pattern.replace_all(value, &self.sanitize_replacement).to_string()
+	fn sanitize_value(&self, value: &String) -> String {
+		self.sanitize_value_pattern.replace_all(value, &self.sanitize_replacement).to_string()
 	}
+
+	pub fn sanitize_key(&self, key: &String) -> String { self.sanitize_key_pattern.replace_all(key, "").to_string() }
 
 	pub fn as_string(&self, value: &ExifAttr) -> String {
 		let mut value_as_string = String::new();
@@ -173,7 +181,7 @@ impl ExifAttrFormatter {
 		}
 		match value {
 			ExifAttr::Path(_) => value_as_string,
-			_ => self.sanitize(&value_as_string),
+			_ => self.sanitize_value(&value_as_string),
 		}
 	}
 }
@@ -181,6 +189,18 @@ impl ExifAttrFormatter {
 struct App {
 	args: Args,
 	fmt: ExifAttrFormatter,
+}
+
+macro_rules! sys_prefix {
+	() => {
+		"Sys"
+	};
+}
+
+macro_rules! with_sys_prefix {
+	($name:expr) => {
+		concat!(sys_prefix!(), $name).to_owned()
+	};
 }
 
 impl App {
@@ -204,33 +224,39 @@ impl App {
 	fn extract_props(&self, path: &PathBuf) -> BTreeMap<String, ExifAttr> {
 		let mut out = BTreeMap::new();
 		out.insert(
-			"sys.Ext".to_owned(),
+			with_sys_prefix!("Ext"),
 			ExifAttr::from_opt_path(path.extension().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
 		);
 		out.insert(
-			"sys.Name".to_owned(),
+			with_sys_prefix!("Name"),
 			ExifAttr::from_opt_path(path.file_stem().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
 		);
 		out.insert(
-			"sys.FullName".to_owned(),
+			with_sys_prefix!("FullName"),
 			ExifAttr::from_opt_path(path.file_name().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
 		);
-		out.insert("sys.Path".to_owned(), ExifAttr::from_opt_path(path.parent()));
+		out.insert(with_sys_prefix!("Path"), ExifAttr::from_opt_path(path.parent()));
 		let mut r_path = PathBuf::new();
-		for (i, component) in path.components().enumerate() {
+		let components = path.components().collect::<Vec<_>>();
+		let n_components = components.len();
+		for (i, component) in components.iter().enumerate() {
 			out.insert(
-				format!("sys.Path{}", i),
+				format!(concat!(sys_prefix!(), "PathElem{}"), i),
 				ExifAttr::from_opt_path(Some(PathBuf::from(component.as_os_str()).as_path())),
 			);
 			r_path.push(component);
-			out.insert(format!("fs.RPath{}", i), ExifAttr::from_opt_path(Some(r_path.as_path())));
+			out.insert(format!(concat!(sys_prefix!(), "Path{}"), i), ExifAttr::from_opt_path(Some(r_path.as_path())));
+			out.insert(
+				format!(concat!(sys_prefix!(), "RPath{}"), n_components - i - 1),
+				ExifAttr::from_opt_path(Some(r_path.as_path())),
+			);
 		}
 		match fs::metadata(path) {
 			Ok(metadata) => {
-				out.insert("sys.DateTimeCreated".to_owned(), ExifAttr::from_opt_filetime(metadata.created().ok()));
-				out.insert("sys.DateTimeModified".to_owned(), ExifAttr::from_opt_filetime(metadata.modified().ok()));
-				out.insert("sys.DateTimeAccessed".to_owned(), ExifAttr::from_opt_filetime(metadata.accessed().ok()));
-				out.insert("sys.Size".to_owned(), ExifAttr::Integer(metadata.len() as i64));
+				out.insert(with_sys_prefix!("DateTimeCreated"), ExifAttr::from_opt_filetime(metadata.created().ok()));
+				out.insert(with_sys_prefix!("DateTimeModified"), ExifAttr::from_opt_filetime(metadata.modified().ok()));
+				out.insert(with_sys_prefix!("DateTimeAccessed"), ExifAttr::from_opt_filetime(metadata.accessed().ok()));
+				out.insert(with_sys_prefix!("Size"), ExifAttr::Integer(metadata.len() as i64));
 			}
 			Err(err) => error!("Unable to read metadata for {:?}: {:?}", path, err),
 		}
@@ -239,7 +265,7 @@ impl App {
 			let mut hasher = Sha1::new();
 			match io::copy(&mut file, &mut hasher) {
 				Ok(_) => {
-					out.insert("sys.Sha1".to_owned(), ExifAttr::Text(hex::encode(hasher.finalize())));
+					out.insert(with_sys_prefix!("Sha1"), ExifAttr::Text(hex::encode(hasher.finalize())));
 				}
 				Err(e) => error!("Unable to compute hash for {:?}: {:?}", &path, e),
 			}
@@ -282,7 +308,11 @@ impl App {
 							exif::Value::Double(ref v) => ExifAttr::from_opt_real(v.first()),
 							exif::Value::Unknown(_, _, _) => ExifAttr::Nothing,
 						};
-						out.insert(format!("{}.{}", f.ifd_num, f.tag), value);
+						let key = match f.ifd_num {
+							In::THUMBNAIL => format!("Tn{}", f.tag),
+							_ => f.tag.to_string(),
+						};
+						out.insert(self.fmt.sanitize_key(&key), value);
 					}
 				}
 			}
@@ -311,7 +341,7 @@ impl App {
 				match reg.render_template(&self.args.out, &data) {
 					Ok(dest) => {
 						let dest_path = PathBuf::from(dest);
-						info!("{:?} -> {:?}", src_path, dest_path);
+						println!("{:?} {:?}", src_path, dest_path);
 					}
 					Err(e) => error!("Invalid pattern or data {}: {}", &self.args.out, e),
 				}
