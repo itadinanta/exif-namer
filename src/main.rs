@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, Local, NaiveDateTime};
 use clap::builder::PossibleValue;
 use clap::{Parser, ValueEnum};
 use exif::In;
@@ -19,7 +21,7 @@ use sha1::{Digest, Sha1};
 enum Mode {
 	Move,
 	Copy,
-	SoftLink,
+	SymLink,
 	HardLink,
 	Info,
 }
@@ -35,15 +37,15 @@ impl std::fmt::Display for Mode {
 }
 
 impl ValueEnum for Mode {
-	fn value_variants<'a>() -> &'a [Self] { &[Self::Move, Self::Copy, Self::SoftLink, Self::HardLink, Self::Info] }
+	fn value_variants<'a>() -> &'a [Self] { &[Self::Move, Self::Copy, Self::SymLink, Self::HardLink, Self::Info] }
 
 	fn to_possible_value(&self) -> Option<PossibleValue> {
 		Some(match self {
+			Self::Move => PossibleValue::new("mv"),
+			Self::Copy => PossibleValue::new("cp"),
+			Self::SymLink => PossibleValue::new("symlink"),
+			Self::HardLink => PossibleValue::new("ln"),
 			Self::Info => PossibleValue::new("info"),
-			Self::Copy => PossibleValue::new("copy"),
-			Self::Move => PossibleValue::new("move"),
-			Self::SoftLink => PossibleValue::new("soft_link"),
-			Self::HardLink => PossibleValue::new("hard_link"),
 		})
 	}
 }
@@ -57,7 +59,7 @@ struct Args {
 	#[arg(
 		short,
 		long,
-		default_value = "{{SysPath}}/{{SysIdx}}_{{SysName}}.{{SysExt}}",
+		default_value = "{{SysPath}}/{{SysName}}_{{SysIdx}}{{SysDotExt}}",
 		help = "Destination string template. Uses Handlebars syntax",
 		long_help = "Properties are populated by inspecting the source file. \
 			Use -m info for details of properties available for each source file"
@@ -83,6 +85,16 @@ struct Args {
 
 	#[arg(short, long, default_value_t = false, help = "Force overwrite if destination file exists")]
 	force: bool,
+
+	#[arg(long, default_value_t = false, help = "When moving files, delete the source folder if empty")]
+	delete_empty_dirs: bool,
+
+	#[arg(
+		long,
+		default_value_t = false,
+		help = "Convert symlink targets to absolute path even if a relative path is available"
+	)]
+	force_absolute_symlinks: bool,
 
 	#[arg(long, default_value_t = 100, help = "Truncate long values in -m info. Set to 0 for infinite length")]
 	max_display_len: usize,
@@ -148,9 +160,9 @@ impl PropertyValue {
 		}
 	}
 
-	fn from_opt_path(from: Option<&Path>) -> Self {
+	fn from_opt_path<P: AsRef<Path>>(from: Option<P>) -> Self {
 		match from {
-			Some(dir) => PropertyValue::Path(PathBuf::from(dir)),
+			Some(dir) => PropertyValue::Path(PathBuf::from(dir.as_ref())),
 			None => PropertyValue::Nothing,
 		}
 	}
@@ -252,6 +264,8 @@ impl ExifAttrFormatter {
 
 struct App<'a> {
 	args: Args,
+	now: DateTime<Local>,
+	cwd: PathBuf,
 	attr_formatter: ExifAttrFormatter,
 	handlebars: handlebars::Handlebars<'a>,
 }
@@ -275,6 +289,9 @@ impl<'a> App<'a> {
 		let attr_formatter =
 			ExifAttrFormatter::new(args.timestamp_format.clone(), &args.invalid_characters, args.replacement.clone())?;
 		let mut handlebars = handlebars::Handlebars::new();
+		handlebars.set_dev_mode(true);
+		handlebars.set_prevent_indent(true);
+		handlebars.register_escape_fn(handlebars::no_escape);
 		string_helpers::register(&mut handlebars);
 		regex_helpers::register(&mut handlebars);
 		path_helpers::register(&mut handlebars);
@@ -283,15 +300,19 @@ impl<'a> App<'a> {
 		handlebars
 			.register_template_string(DESTINATION_TEMPLATE_ID, &args.destination)
 			.map_err(|e| regex::Error::Syntax(format!("Handlebar syntax error in {}: {}", args.destination, e)))?;
-
-		Ok(App { args, attr_formatter, handlebars })
+		let now = Local::now();
+		let cwd = std::env::current_dir().expect("Unable to determine current directory");
+		Ok(App { args, now, cwd, attr_formatter, handlebars })
 	}
 
 	fn find_matches(&self, pattern: &str) -> Result<Vec<PathBuf>, PatternError> {
 		let mut out = Vec::new();
 		for iter in glob::glob(pattern)? {
 			match iter {
-				Ok(path) => out.push(path),
+				Ok(path) =>
+					if path.is_file() {
+						out.push(path)
+					},
 				Err(e) => error!("Invalid glob pattern {}: {}", pattern, e),
 			}
 		}
@@ -300,18 +321,41 @@ impl<'a> App<'a> {
 
 	fn extract_properties<F>(&self, src: &PathBuf, mut add_property: F)
 	where F: FnMut(&str, &PropertyValue) {
+		// global properties
+		add_property(
+			// extension without the leading dot
+			with_sys_prefix!("DateTimeNow"),
+			&PropertyValue::Timestamp(self.now.naive_local()),
+		);
+		add_property(
+			// extension without the leading dot
+			with_sys_prefix!("Cwd"),
+			&PropertyValue::from_opt_path(Some(&self.cwd)),
+		);
 		// Path properties
 		add_property(
+			// extension without the leading dot
 			with_sys_prefix!("Ext"),
-			&PropertyValue::from_opt_path(src.extension().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
+			&PropertyValue::from_opt_path(src.extension()),
 		);
 		add_property(
+			// extension with the leading dot
+			with_sys_prefix!("DotExt"),
+			&PropertyValue::from_opt_path(src.extension().map(|ext| {
+				let mut d = OsStr::new(".").to_os_string();
+				d.push(ext);
+				d
+			})),
+		);
+		add_property(
+			// name without extension
 			with_sys_prefix!("Name"),
-			&PropertyValue::from_opt_path(src.file_stem().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
+			&PropertyValue::from_opt_path(src.file_stem()),
 		);
 		add_property(
+			// name with extension
 			with_sys_prefix!("FullName"),
-			&PropertyValue::from_opt_path(src.file_name().map(PathBuf::from).as_ref().map(PathBuf::as_path)),
+			&PropertyValue::from_opt_path(src.file_name()),
 		);
 		let parent = src.parent();
 		add_property(with_sys_prefix!("Path"), &PropertyValue::from_opt_path(parent));
@@ -321,11 +365,11 @@ impl<'a> App<'a> {
 		for (i, component) in components.iter().enumerate() {
 			add_property(
 				&format!(concat!(sys_prefix!(), "PathElem{}"), i),
-				&PropertyValue::from_opt_path(Some(PathBuf::from(component.as_os_str()).as_path())),
+				&PropertyValue::from_opt_path(Some(component)),
 			);
 			path_head.push(component);
 			add_property(
-				&format!(concat!(sys_prefix!(), "PathUp{}"), n_components - i - 1),
+				&format!(concat!(sys_prefix!(), "PathAncestor{}"), n_components - i - 1),
 				&PropertyValue::from_opt_path(Some(path_head.as_path())),
 			);
 			add_property(
@@ -338,7 +382,7 @@ impl<'a> App<'a> {
 			for i in 0..(n_components - 1) {
 				add_property(
 					&format!(concat!(sys_prefix!(), "PathTail{}"), i),
-					&PropertyValue::from_opt_path(Some(path_tail.as_path())),
+					&PropertyValue::from_opt_path(Some(&path_tail)),
 				);
 				path_tail.next();
 			}
@@ -432,43 +476,109 @@ impl<'a> App<'a> {
 			debug!("Matching pattern '{}'", glob);
 			let paths = self.find_matches(glob).expect("Error extracting source files");
 
-			// for each file matching the current glob
-			for src_path in paths.iter().filter(|f| f.is_file()) {
-				// extract properties as a String -> Value map
-				let mut data = serde_json::value::Map::new();
-				self.extract_properties(src_path, |key, value| {
-					let value_as_string = self.attr_formatter.as_string(value);
-					data.insert(key.to_owned(), Value::String(value_as_string));
-				});
-				data.insert(
-					with_sys_prefix!("Idx").to_string(),
-					Value::String(format!("{:01$}", idx_counter, self.args.idx_width)),
-				);
-				idx_counter += 1;
+			self.apply_matches(&paths, &mut idx_counter);
 
-				match self.handlebars.render(DESTINATION_TEMPLATE_ID, &data) {
-					Ok(dest) => {
-						let dest_path = PathBuf::from(dest);
-						self.apply_mode(self.args.mode, src_path, &dest_path, &data);
+			if self.args.mode == Mode::Move && self.args.delete_empty_dirs {
+				self.cleanup_empty_dirs(&paths);
+			}
+		}
+	}
+
+	fn contains_files<P: AsRef<Path>>(&self, dir: P) -> io::Result<bool> {
+		for maybe_child in fs::read_dir(dir)? {
+			let child = maybe_child?;
+			if child.file_type()?.is_dir() && (child.file_name() == "." || child.file_name() == "..") {
+				continue;
+			}
+			return Ok(true);
+		}
+		Ok(false)
+	}
+
+	fn delete_empty_dir<P: AsRef<Path>>(&self, path_ref: P) -> bool {
+		let candidate_path = path_ref.as_ref();
+		if !self.args.dry_run {
+			debug!("Attempting to delete directory {:?}", &candidate_path);
+			if let Ok(contains_files) = self.contains_files(candidate_path) {
+				if !contains_files {
+					if let Err(e) = fs::remove_dir(candidate_path) {
+						error!("Unable to delete directory {:?}: {}", candidate_path, e);
+					} else {
+						return true;
 					}
-					Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
 				}
+			}
+		}
+		return false;
+	}
+
+	fn cleanup_empty_dirs(&self, paths: &Vec<PathBuf>) {
+		let mut candidate_paths = BTreeSet::new();
+
+		for src_path in paths.iter() {
+			if let Some(parent) = src_path.parent() {
+				for ancestor in parent.ancestors() {
+					if !ancestor.as_os_str().is_empty() && !candidate_paths.contains(ancestor) {
+						candidate_paths.insert(PathBuf::from(ancestor));
+					}
+				}
+			}
+		}
+
+		for candidate_path in candidate_paths.iter().rev() {
+			let deleted = self.delete_empty_dir(candidate_path);
+			if self.args.verbose {
+				println!("{} {:?}", if deleted { "rmdir" } else { "#rmdir" }, candidate_path);
+			}
+		}
+	}
+
+	fn apply_matches(&self, paths: &Vec<PathBuf>, idx_counter: &mut usize) {
+		// for each file matching the current glob
+		for src_path in paths.iter() {
+			// extract properties as a String -> Value map
+			let mut data = serde_json::value::Map::new();
+			self.extract_properties(src_path, |key, value| {
+				let value_as_string = self.attr_formatter.as_string(value);
+				data.insert(key.to_owned(), Value::String(value_as_string));
+			});
+			data.insert(
+				with_sys_prefix!("Idx").to_string(),
+				Value::String(format!("{:01$}", idx_counter, self.args.idx_width)),
+			);
+			*idx_counter += 1;
+
+			match self.handlebars.render(DESTINATION_TEMPLATE_ID, &data) {
+				Ok(dest) => {
+					let dest_path = PathBuf::from(dest);
+					self.apply_mode(self.args.mode, src_path, &dest_path, &data);
+				}
+				Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
 			}
 		}
 	}
 
 	fn apply_mode(&self, mode: Mode, src: &PathBuf, dest: &PathBuf, data: &Map<String, Value>) {
-		println!("{:?} {:?} {:?}", mode, src, dest);
+		if self.args.verbose {
+			println!("{} {:?} {:?}", mode, src, dest);
+		}
 
 		if self.args.mode != Mode::Info {
-			if src == dest {
+			if same_file::is_same_file(src, dest).unwrap_or(false) {
 				warn!("Source and destination file are the same, skipping");
 				return;
 			}
 
-			if dest.exists() && !self.args.force {
-				warn!("Destination file exists, skipping. Use --force to overwrite");
-				return;
+			if dest.exists() || dest.is_symlink() {
+				if self.args.force {
+					if let Err(e) = fs::remove_file(dest) {
+						error!("Destination exists, and --force specified, but could not remove: {}", e);
+						return;
+					}
+				} else {
+					warn!("Destination file exists, skipping. Use --force to overwrite");
+					return;
+				}
 			}
 
 			if self.args.dry_run {
@@ -496,12 +606,35 @@ impl<'a> App<'a> {
 				if let Err(e) = fs::copy(src, dest) {
 					error!("Could not copy {:?}: {}", src, e);
 				},
-			Mode::SoftLink =>
-				if let Err(e) = fs::soft_link(src, dest) {
-					// this is deprecated but we are sure we are linking files rather than
+			Mode::SymLink => {
+				// if src is absolute, we use the absolute path no matter what
+				let target = if src.is_absolute() {
+					src.to_path_buf()
+				} else {
+					// if src is a relative path, we need the absolute path to either use it,
+					// or determine a relative path from the link name
+					let src_absolute = std::path::absolute(src).unwrap_or_else(|_| self.cwd.join(src));
+					if self.args.force_absolute_symlinks {
+						src_absolute
+					} else if let Some(src_relative) = pathdiff::diff_paths(
+						&src_absolute,
+						std::path::absolute(dest).unwrap_or_else(|_| self.cwd.join(dest)).parent().unwrap(),
+					) {
+						if self.args.verbose {
+							println!("# -> {:?}", src_relative);
+						}
+						src_relative
+					} else {
+						src_absolute
+					}
+				};
+
+				if let Err(e) = fs::soft_link(target, dest) {
+					// this is deprecated, but we are sure we are linking files rather than
 					// directories, so there is no need to call the os-dependent version
 					error!("Could not symlink {:?}: {}", src, e);
-				},
+				}
+			}
 			Mode::HardLink =>
 				if let Err(e) = fs::hard_link(src, dest) {
 					error!("Could not hard link {:?}: {}", src, e);
