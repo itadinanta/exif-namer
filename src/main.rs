@@ -1,14 +1,7 @@
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
-use std::fmt::Write;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
-use std::{fmt, fs};
-
 use chrono::{DateTime, Local, NaiveDateTime};
 use clap::builder::PossibleValue;
 use clap::{Parser, ValueEnum};
+use const_format::concatcp;
 use exif::In;
 use glob::*;
 use handlebars_misc_helpers::{env_helpers, path_helpers, regex_helpers, string_helpers};
@@ -16,6 +9,14 @@ use log::*;
 use log4rs::append::console::{ConsoleAppender, Target};
 use serde_json::value::*;
 use sha1::{Digest, Sha1};
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fmt::Write;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::UNIX_EPOCH;
+use std::{fmt, fs};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 enum Mode {
@@ -86,13 +87,13 @@ struct Args {
 	#[arg(short, long, default_value_t = false, help = "Force overwrite if destination file exists")]
 	force: bool,
 
-	#[arg(long, default_value_t = true, help = "Disable Handlebars strict mode")]
+	#[arg(long, default_value_t = false, help = "Disable Handlebars strict mode")]
 	no_strict: bool,
 
-	#[arg(long, default_value_t = true, help = "Disable (slow) sha1 hash calculation")]
+	#[arg(long, default_value_t = false, help = "Disable (slow) sha1 hash calculation")]
 	no_sha1: bool,
 
-	#[arg(long, default_value_t = true, help = "Disable exif parsing")]
+	#[arg(long, default_value_t = false, help = "Disable exif parsing")]
 	no_exif: bool,
 
 	#[arg(long, default_value_t = false, help = "When moving files, delete the source folder if empty")]
@@ -290,15 +291,13 @@ struct App<'a> {
 	handlebars: handlebars::Handlebars<'a>,
 }
 
-macro_rules! sys_prefix {
-	() => {
-		"Sys"
-	};
-}
+const EXIF_PREFIX: &'static str = "Exif";
+const EXIFTN_PREFIX: &'static str = "ExifTn";
+const SYS_PREFIX: &'static str = "Sys";
 
-macro_rules! with_sys_prefix {
-	($name:expr) => {
-		concat!(sys_prefix!(), $name)
+macro_rules! prepend {
+	($prefix:tt, $name:expr) => {
+		concatcp!($prefix, $name)
 	};
 }
 
@@ -343,80 +342,81 @@ impl<'a> App<'a> {
 		return Ok(out);
 	}
 
-	fn extract_properties<F>(&self, src: &PathBuf, app_state: &mut AppState, mut add_property: F)
-	where F: FnMut(&str, &PropertyValue, &mut AppState) {
+	fn extract_properties<F>(&self, app_state: &mut AppState, src: &PathBuf, mut add_property: F)
+	where F: FnMut(&mut AppState, &str, &PropertyValue) {
 		// global properties
+
 		add_property(
 			// extension without the leading dot
-			with_sys_prefix!("DateTimeNow"),
-			&PropertyValue::Timestamp(self.now.naive_local()),
 			app_state,
+			&prepend!(SYS_PREFIX, "DateTimeNow"),
+			&PropertyValue::Timestamp(self.now.naive_local()),
 		);
 		add_property(
 			// extension without the leading dot
-			with_sys_prefix!("Cwd"),
-			&PropertyValue::from_opt_path(Some(&self.cwd)),
 			app_state,
+			prepend!(SYS_PREFIX, "Cwd"),
+			&PropertyValue::from_opt_path(Some(&self.cwd)),
 		);
 		// Path properties
 		add_property(
 			// extension without the leading dot
-			with_sys_prefix!("Ext"),
-			&PropertyValue::from_opt_path(src.extension()),
 			app_state,
+			prepend!(SYS_PREFIX, "Ext"),
+			&PropertyValue::from_opt_path(src.extension()),
 		);
 		add_property(
 			// extension with the leading dot
-			with_sys_prefix!("DotExt"),
+			app_state,
+			prepend!(SYS_PREFIX, "DotExt"),
 			&PropertyValue::from_opt_path(src.extension().map(|ext| {
 				let mut d = OsStr::new(".").to_os_string();
 				d.push(ext);
 				d
 			})),
-			app_state,
 		);
 		add_property(
-			// name without extension
-			with_sys_prefix!("Name"),
-			&PropertyValue::from_opt_path(src.file_stem()),
 			app_state,
+			// name without extension
+			prepend!(SYS_PREFIX, "Name"),
+			&PropertyValue::from_opt_path(src.file_stem()),
 		);
 		add_property(
 			// name with extension
-			with_sys_prefix!("FullName"),
-			&PropertyValue::from_opt_path(src.file_name()),
 			app_state,
+			prepend!(SYS_PREFIX, "FullName"),
+			&PropertyValue::from_opt_path(src.file_name()),
 		);
 		let parent = src.parent();
-		add_property(with_sys_prefix!("Path"), &PropertyValue::from_opt_path(parent), app_state);
+		add_property(app_state, prepend!(SYS_PREFIX, "Path"), &PropertyValue::from_opt_path(parent));
 		let mut path_head = PathBuf::new();
 		let components = src.components().collect::<Vec<_>>();
 		let n_components = components.len();
 		for (i, component) in components.iter().enumerate() {
 			add_property(
-				&format!(concat!(sys_prefix!(), "PathElem{}"), i),
-				&PropertyValue::from_opt_path(Some(component)),
 				app_state,
+				&format!("{}{}", prepend!(SYS_PREFIX, "PathElem"), i),
+				&PropertyValue::from_opt_path(Some(component)),
 			);
 			path_head.push(component);
 			add_property(
-				&format!(concat!(sys_prefix!(), "PathAncestor{}"), n_components - i - 1),
-				&PropertyValue::from_opt_path(Some(path_head.as_path())),
 				app_state,
+				&format!("{}{}", prepend!(SYS_PREFIX, "PathAncestor"), n_components - i - 1),
+				&PropertyValue::from_opt_path(Some(path_head.as_path())),
 			);
 			add_property(
-				&format!(concat!(sys_prefix!(), "PathHead{}"), i),
-				&PropertyValue::from_opt_path(Some(path_head.as_path())),
 				app_state,
+				&format!("{}{}", prepend!(SYS_PREFIX, "PathHead"), i),
+				&PropertyValue::from_opt_path(Some(path_head.as_path())),
 			);
 		}
 		if let Some(up) = parent {
 			let mut path_tail = up.components();
 			for i in 0..(n_components - 1) {
 				add_property(
-					&format!(concat!(sys_prefix!(), "PathTail{}"), i),
-					&PropertyValue::from_opt_path(Some(&path_tail)),
 					app_state,
+					&format!("{}{}", prepend!(SYS_PREFIX, "PathTail"), i),
+					&PropertyValue::from_opt_path(Some(&path_tail)),
 				);
 				path_tail.next();
 			}
@@ -426,21 +426,21 @@ impl<'a> App<'a> {
 		match fs::metadata(src) {
 			Ok(metadata) => {
 				add_property(
-					with_sys_prefix!("DateTimeModified"),
+					app_state,
+					prepend!(SYS_PREFIX, "DateTimeModified"),
 					&PropertyValue::from_opt_filetime(metadata.modified().ok()),
-					app_state,
 				);
 				add_property(
-					with_sys_prefix!("DateTimeCreated"),
+					app_state,
+					prepend!(SYS_PREFIX, "DateTimeCreated"),
 					&PropertyValue::from_opt_filetime(metadata.created().or_else(|_| metadata.modified()).ok()),
-					app_state,
 				);
 				add_property(
-					with_sys_prefix!("DateTimeAccessed"),
-					&PropertyValue::from_opt_filetime(metadata.accessed().ok()),
 					app_state,
+					prepend!(SYS_PREFIX, "DateTimeAccessed"),
+					&PropertyValue::from_opt_filetime(metadata.accessed().ok()),
 				);
-				add_property(with_sys_prefix!("Size"), &PropertyValue::Integer(metadata.len() as i64), app_state);
+				add_property(app_state, prepend!(SYS_PREFIX, "Size"), &PropertyValue::Integer(metadata.len() as i64));
 			}
 			Err(e) => {
 				error!("Unable to read fs metadata for {:?}: {}", src, e);
@@ -455,9 +455,9 @@ impl<'a> App<'a> {
 				match io::copy(&mut file, &mut hasher) {
 					Ok(_) => {
 						add_property(
-							&with_sys_prefix!("Sha1"),
-							&PropertyValue::Text(hex::encode(hasher.finalize())),
 							app_state,
+							&prepend!(SYS_PREFIX, "Sha1"),
+							&PropertyValue::Text(hex::encode(hasher.finalize())),
 						);
 					}
 					Err(e) => {
@@ -508,10 +508,10 @@ impl<'a> App<'a> {
 								exif::Value::Unknown(_, _, _) => PropertyValue::Nothing,
 							};
 							let key = match f.ifd_num {
-								In::THUMBNAIL => format!("Tn{}", f.tag),
-								_ => f.tag.to_string(),
+								In::THUMBNAIL => format!("{}{}", EXIFTN_PREFIX, f.tag),
+								_ => format!("{}{}", EXIF_PREFIX, f.tag),
 							};
-							add_property(&self.attr_formatter.sanitize_key(&key), &value, app_state);
+							add_property(app_state, &self.attr_formatter.sanitize_key(&key), &value);
 						}
 					}
 				}
@@ -520,19 +520,21 @@ impl<'a> App<'a> {
 		}
 	}
 
-	fn run(&self, app_state: &mut AppState) {
+	fn run(&self) -> AppState {
+		let mut app_state = AppState::default();
 		let mut idx_counter: usize = self.args.idx_start;
 		// iterate through all globs
 		for glob in &self.args.sources {
 			debug!("Matching pattern '{}'", glob);
-			let paths = self.find_matches(glob, app_state).expect("Error extracting source files");
+			let paths = self.find_matches(glob, &mut app_state).expect("Error extracting source files");
 
-			self.apply_matches(&paths, &mut idx_counter, app_state);
+			self.apply_matches(&mut app_state, &paths, &mut idx_counter);
 
 			if self.args.mode == Mode::Move && self.args.delete_empty_dirs {
 				self.cleanup_empty_dirs(&paths);
 			}
 		}
+		app_state
 	}
 
 	fn contains_files<P: AsRef<Path>>(&self, dir: P) -> io::Result<bool> {
@@ -584,12 +586,17 @@ impl<'a> App<'a> {
 		}
 	}
 
-	fn apply_matches(&self, paths: &Vec<PathBuf>, idx_counter: &mut usize, app_state: &mut AppState) {
+	fn apply_matches(&self, app_state: &mut AppState, paths: &Vec<PathBuf>, idx_counter: &mut usize) {
 		// for each file matching the current glob
 		for src_path in paths.iter() {
 			// extract properties as a String -> Value map
 			let mut data = serde_json::value::Map::new();
-			self.extract_properties(src_path, app_state, |key, value, app_state| {
+			data.insert(
+				prepend!(SYS_PREFIX, "Idx").to_string(),
+				Value::String(format!("{:01$}", idx_counter, self.args.idx_width)),
+			);
+			*idx_counter += 1;
+			self.extract_properties(app_state, src_path, |app_state, key, value| {
 				match self.attr_formatter.as_string(value) {
 					Ok(value_as_string) => {
 						data.insert(key.to_owned(), Value::String(value_as_string));
@@ -600,16 +607,11 @@ impl<'a> App<'a> {
 					}
 				}
 			});
-			data.insert(
-				with_sys_prefix!("Idx").to_string(),
-				Value::String(format!("{:01$}", idx_counter, self.args.idx_width)),
-			);
-			*idx_counter += 1;
 
 			match self.handlebars.render(DESTINATION_TEMPLATE_ID, &data) {
 				Ok(dest) => {
 					let dest_path = PathBuf::from(dest);
-					self.apply_mode(self.args.mode, src_path, &dest_path, &data, app_state);
+					self.apply_mode(app_state, self.args.mode, src_path, &dest_path, &data);
 				}
 				Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
 			}
@@ -618,11 +620,11 @@ impl<'a> App<'a> {
 
 	fn apply_mode(
 		&self,
+		app_state: &mut AppState,
 		mode: Mode,
 		src: &PathBuf,
 		dest: &PathBuf,
 		data: &Map<String, Value>,
-		app_state: &mut AppState,
 	) {
 		if self.args.verbose {
 			println!("{} {:?} {:?}", mode, src, dest);
@@ -733,20 +735,24 @@ impl<'a> App<'a> {
 	}
 }
 
-fn main() {
+fn main() -> ExitCode {
+	// Hardcoded log4rs to avoid loading a config file
 	use log4rs::config::*;
-
 	let log_appender = Appender::builder()
-		.build("stdout".to_string(), Box::new(ConsoleAppender::builder().target(Target::Stderr).build()));
-	let log_root = Root::builder().appender("stdout".to_string()).build(LevelFilter::Info);
+		.build("stderr".to_string(), Box::new(ConsoleAppender::builder().target(Target::Stderr).build()));
+	let log_root = Root::builder().appender("stderr".to_string()).build(LevelFilter::Info);
 	let log_config = Config::builder().appender(log_appender).build(log_root);
-
 	init_config(log_config.expect("Invalid log configuration")).expect("Unable to initialize log4rs");
 
-	let mut report = AppState::default();
+	// Run the app
 	let app = App::new(Args::parse()).expect("Invalid arguments");
-	app.run(&mut report);
+	let report = app.run();
+
+	// Report run status
 	if report.has_errors_or_warnings() {
-		warn!("{} errors, {} warnings", report.error_count(), report.warning_count());
+		warn!("{} error(s), {} warning(s)", report.error_count(), report.warning_count());
+		ExitCode::FAILURE
+	} else {
+		ExitCode::SUCCESS
 	}
 }
