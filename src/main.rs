@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt::Write;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+use std::{fmt, fs};
 
 use chrono::{DateTime, Local, NaiveDateTime};
 use clap::builder::PossibleValue;
@@ -30,8 +30,8 @@ impl Default for Mode {
 	fn default() -> Self { Self::Move }
 }
 
-impl std::fmt::Display for Mode {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Mode {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		self.to_possible_value().expect("no values are skipped").get_name().fmt(f)
 	}
 }
@@ -85,6 +85,15 @@ struct Args {
 
 	#[arg(short, long, default_value_t = false, help = "Force overwrite if destination file exists")]
 	force: bool,
+
+	#[arg(long, default_value_t = true, help = "Disable Handlebars strict mode")]
+	no_strict: bool,
+
+	#[arg(long, default_value_t = true, help = "Disable (slow) sha1 hash calculation")]
+	no_sha1: bool,
+
+	#[arg(long, default_value_t = true, help = "Disable exif parsing")]
+	no_exif: bool,
 
 	#[arg(long, default_value_t = false, help = "When moving files, delete the source folder if empty")]
 	delete_empty_dirs: bool,
@@ -229,7 +238,7 @@ impl ExifAttrFormatter {
 		})
 	}
 
-	fn fmt<W>(&self, value: &PropertyValue, f: &mut W) -> std::fmt::Result
+	fn fmt<W>(&self, value: &PropertyValue, f: &mut W) -> fmt::Result
 	where W: Write {
 		match value {
 			// write!(f, "{}", strings)
@@ -250,16 +259,27 @@ impl ExifAttrFormatter {
 
 	pub fn sanitize_key(&self, key: &String) -> String { self.sanitize_key_pattern.replace_all(key, "").to_string() }
 
-	pub fn as_string(&self, value: &PropertyValue) -> String {
+	pub fn as_string(&self, value: &PropertyValue) -> Result<String, fmt::Error> {
 		let mut value_as_string = String::new();
-		if let Err(e) = self.fmt(&value, &mut value_as_string) {
-			error!("Cannot convert {:?} to string: {}", value, e)
-		}
+		self.fmt(&value, &mut value_as_string)?;
 		match value {
-			PropertyValue::Path(_) => value_as_string,
-			_ => self.sanitize_value(&value_as_string),
+			PropertyValue::Path(_) => Ok(value_as_string),
+			_ => Ok(self.sanitize_value(&value_as_string)),
 		}
 	}
+}
+#[derive(Default, Debug)]
+struct AppState {
+	warning_count: usize,
+	error_count: usize,
+}
+
+impl AppState {
+	fn report_error(&mut self) { self.error_count += 1; }
+	fn report_warning(&mut self) { self.warning_count += 1; }
+	fn error_count(&self) -> usize { self.error_count }
+	fn warning_count(&self) -> usize { self.warning_count }
+	fn has_errors_or_warnings(&self) -> bool { self.error_count > 0 || self.warning_count > 0 }
 }
 
 struct App<'a> {
@@ -291,6 +311,7 @@ impl<'a> App<'a> {
 		let mut handlebars = handlebars::Handlebars::new();
 		handlebars.set_dev_mode(true);
 		handlebars.set_prevent_indent(true);
+		handlebars.set_strict_mode(!args.no_strict);
 		handlebars.register_escape_fn(handlebars::no_escape);
 		string_helpers::register(&mut handlebars);
 		regex_helpers::register(&mut handlebars);
@@ -305,7 +326,7 @@ impl<'a> App<'a> {
 		Ok(App { args, now, cwd, attr_formatter, handlebars })
 	}
 
-	fn find_matches(&self, pattern: &str) -> Result<Vec<PathBuf>, PatternError> {
+	fn find_matches(&self, pattern: &str, reporter: &mut AppState) -> Result<Vec<PathBuf>, PatternError> {
 		let mut out = Vec::new();
 		for iter in glob::glob(pattern)? {
 			match iter {
@@ -313,30 +334,36 @@ impl<'a> App<'a> {
 					if path.is_file() {
 						out.push(path)
 					},
-				Err(e) => error!("Invalid glob pattern {}: {}", pattern, e),
+				Err(e) => {
+					error!("Invalid glob pattern {}: {}", pattern, e);
+					reporter.report_error();
+				}
 			}
 		}
 		return Ok(out);
 	}
 
-	fn extract_properties<F>(&self, src: &PathBuf, mut add_property: F)
-	where F: FnMut(&str, &PropertyValue) {
+	fn extract_properties<F>(&self, src: &PathBuf, app_state: &mut AppState, mut add_property: F)
+	where F: FnMut(&str, &PropertyValue, &mut AppState) {
 		// global properties
 		add_property(
 			// extension without the leading dot
 			with_sys_prefix!("DateTimeNow"),
 			&PropertyValue::Timestamp(self.now.naive_local()),
+			app_state,
 		);
 		add_property(
 			// extension without the leading dot
 			with_sys_prefix!("Cwd"),
 			&PropertyValue::from_opt_path(Some(&self.cwd)),
+			app_state,
 		);
 		// Path properties
 		add_property(
 			// extension without the leading dot
 			with_sys_prefix!("Ext"),
 			&PropertyValue::from_opt_path(src.extension()),
+			app_state,
 		);
 		add_property(
 			// extension with the leading dot
@@ -346,19 +373,22 @@ impl<'a> App<'a> {
 				d.push(ext);
 				d
 			})),
+			app_state,
 		);
 		add_property(
 			// name without extension
 			with_sys_prefix!("Name"),
 			&PropertyValue::from_opt_path(src.file_stem()),
+			app_state,
 		);
 		add_property(
 			// name with extension
 			with_sys_prefix!("FullName"),
 			&PropertyValue::from_opt_path(src.file_name()),
+			app_state,
 		);
 		let parent = src.parent();
-		add_property(with_sys_prefix!("Path"), &PropertyValue::from_opt_path(parent));
+		add_property(with_sys_prefix!("Path"), &PropertyValue::from_opt_path(parent), app_state);
 		let mut path_head = PathBuf::new();
 		let components = src.components().collect::<Vec<_>>();
 		let n_components = components.len();
@@ -366,15 +396,18 @@ impl<'a> App<'a> {
 			add_property(
 				&format!(concat!(sys_prefix!(), "PathElem{}"), i),
 				&PropertyValue::from_opt_path(Some(component)),
+				app_state,
 			);
 			path_head.push(component);
 			add_property(
 				&format!(concat!(sys_prefix!(), "PathAncestor{}"), n_components - i - 1),
 				&PropertyValue::from_opt_path(Some(path_head.as_path())),
+				app_state,
 			);
 			add_property(
 				&format!(concat!(sys_prefix!(), "PathHead{}"), i),
 				&PropertyValue::from_opt_path(Some(path_head.as_path())),
+				app_state,
 			);
 		}
 		if let Some(up) = parent {
@@ -383,6 +416,7 @@ impl<'a> App<'a> {
 				add_property(
 					&format!(concat!(sys_prefix!(), "PathTail{}"), i),
 					&PropertyValue::from_opt_path(Some(&path_tail)),
+					app_state,
 				);
 				path_tail.next();
 			}
@@ -392,91 +426,108 @@ impl<'a> App<'a> {
 		match fs::metadata(src) {
 			Ok(metadata) => {
 				add_property(
-					with_sys_prefix!("DateTimeCreated"),
-					&PropertyValue::from_opt_filetime(metadata.created().ok()),
-				);
-				add_property(
 					with_sys_prefix!("DateTimeModified"),
 					&PropertyValue::from_opt_filetime(metadata.modified().ok()),
+					app_state,
+				);
+				add_property(
+					with_sys_prefix!("DateTimeCreated"),
+					&PropertyValue::from_opt_filetime(metadata.created().or_else(|_| metadata.modified()).ok()),
+					app_state,
 				);
 				add_property(
 					with_sys_prefix!("DateTimeAccessed"),
 					&PropertyValue::from_opt_filetime(metadata.accessed().ok()),
+					app_state,
 				);
-				add_property(with_sys_prefix!("Size"), &PropertyValue::Integer(metadata.len() as i64));
+				add_property(with_sys_prefix!("Size"), &PropertyValue::Integer(metadata.len() as i64), app_state);
 			}
-			Err(e) => error!("Unable to read fs metadata for {:?}: {}", src, e),
-		}
-
-		// File content - Sha1 properties
-		if let Ok(mut file) = fs::File::open(&src) {
-			let mut hasher = Sha1::new();
-			match io::copy(&mut file, &mut hasher) {
-				Ok(_) => {
-					add_property(&with_sys_prefix!("Sha1"), &PropertyValue::Text(hex::encode(hasher.finalize())));
-				}
-				Err(e) => error!("Unable to compute hash for {:?}: {}", &src, e),
+			Err(e) => {
+				error!("Unable to read fs metadata for {:?}: {}", src, e);
+				app_state.report_error();
 			}
 		}
 
-		// File content - Exif properties
-		let exif_file = fs::File::open(src);
-		match exif_file {
-			Ok(file) => {
-				let mut buf_reader = io::BufReader::new(&file);
-				let exif_reader = exif::Reader::new();
-				if let Ok(exif) = exif_reader.read_from_container(&mut buf_reader) {
-					for f in exif.fields() {
-						debug!(
-							"{:30} {:50} {:10} {:.50}",
-							f.tag,
-							f.tag.description().unwrap_or(""),
-							f.ifd_num,
-							f.display_value().with_unit(&exif).to_string()
+		if !self.args.no_sha1 {
+			// File content - Sha1 properties
+			if let Ok(mut file) = fs::File::open(&src) {
+				let mut hasher = Sha1::new();
+				match io::copy(&mut file, &mut hasher) {
+					Ok(_) => {
+						add_property(
+							&with_sys_prefix!("Sha1"),
+							&PropertyValue::Text(hex::encode(hasher.finalize())),
+							app_state,
 						);
-						let value = match f.value {
-							exif::Value::Byte(ref n) => PropertyValue::from_opt_integer(n.first()),
-							exif::Value::Ascii(ref text) => {
-								let src = text.first().map(|v| std::str::from_utf8(&*v)).and_then(Result::ok);
-								match f.tag {
-									exif::Tag::DateTime
-									| exif::Tag::DateTimeOriginal
-									| exif::Tag::DateTimeDigitized => PropertyValue::from_opt_str_datetime(src),
-									_ => PropertyValue::from_opt_str(src),
-								}
-							}
-							exif::Value::Short(ref n) => PropertyValue::from_opt_integer(n.first()),
-							exif::Value::Long(ref n) => PropertyValue::from_opt_integer(n.first()),
-							exif::Value::Rational(ref r) => PropertyValue::from_opt_rational(r.first()),
-							exif::Value::SByte(ref n) => PropertyValue::from_opt_integer(n.first()),
-							exif::Value::Undefined(_, _) => PropertyValue::Text(f.display_value().to_string()),
-							exif::Value::SShort(ref n) => PropertyValue::from_opt_integer(n.first()),
-							exif::Value::SLong(ref n) => PropertyValue::from_opt_integer(n.first()),
-							exif::Value::SRational(ref r) => PropertyValue::from_opt_rational(r.first()),
-							exif::Value::Float(ref v) => PropertyValue::from_opt_real(v.first()),
-							exif::Value::Double(ref v) => PropertyValue::from_opt_real(v.first()),
-							exif::Value::Unknown(_, _, _) => PropertyValue::Nothing,
-						};
-						let key = match f.ifd_num {
-							In::THUMBNAIL => format!("Tn{}", f.tag),
-							_ => f.tag.to_string(),
-						};
-						add_property(&self.attr_formatter.sanitize_key(&key), &value);
+					}
+					Err(e) => {
+						error!("Unable to compute hash for {:?}: {}", &src, e);
+						app_state.report_error();
 					}
 				}
 			}
-			Err(e) => error!("Unable to read EXIF from {:?}: {}", src, e),
+		}
+
+		if !self.args.no_exif {
+			// File content - Exif properties
+			let exif_file = fs::File::open(src);
+			match exif_file {
+				Ok(file) => {
+					let mut buf_reader = io::BufReader::new(&file);
+					let exif_reader = exif::Reader::new();
+					if let Ok(exif) = exif_reader.read_from_container(&mut buf_reader) {
+						for f in exif.fields() {
+							debug!(
+								"{:30} {:50} {:10} {:.50}",
+								f.tag,
+								f.tag.description().unwrap_or(""),
+								f.ifd_num,
+								f.display_value().with_unit(&exif).to_string()
+							);
+							let value = match f.value {
+								exif::Value::Byte(ref n) => PropertyValue::from_opt_integer(n.first()),
+								exif::Value::Ascii(ref text) => {
+									let src = text.first().map(|v| std::str::from_utf8(&*v)).and_then(Result::ok);
+									match f.tag {
+										exif::Tag::DateTime
+										| exif::Tag::DateTimeOriginal
+										| exif::Tag::DateTimeDigitized => PropertyValue::from_opt_str_datetime(src),
+										_ => PropertyValue::from_opt_str(src),
+									}
+								}
+								exif::Value::Short(ref n) => PropertyValue::from_opt_integer(n.first()),
+								exif::Value::Long(ref n) => PropertyValue::from_opt_integer(n.first()),
+								exif::Value::Rational(ref r) => PropertyValue::from_opt_rational(r.first()),
+								exif::Value::SByte(ref n) => PropertyValue::from_opt_integer(n.first()),
+								exif::Value::Undefined(_, _) => PropertyValue::Text(f.display_value().to_string()),
+								exif::Value::SShort(ref n) => PropertyValue::from_opt_integer(n.first()),
+								exif::Value::SLong(ref n) => PropertyValue::from_opt_integer(n.first()),
+								exif::Value::SRational(ref r) => PropertyValue::from_opt_rational(r.first()),
+								exif::Value::Float(ref v) => PropertyValue::from_opt_real(v.first()),
+								exif::Value::Double(ref v) => PropertyValue::from_opt_real(v.first()),
+								exif::Value::Unknown(_, _, _) => PropertyValue::Nothing,
+							};
+							let key = match f.ifd_num {
+								In::THUMBNAIL => format!("Tn{}", f.tag),
+								_ => f.tag.to_string(),
+							};
+							add_property(&self.attr_formatter.sanitize_key(&key), &value, app_state);
+						}
+					}
+				}
+				Err(e) => error!("Unable to read EXIF from {:?}: {}", src, e),
+			}
 		}
 	}
 
-	fn run(&self) {
+	fn run(&self, app_state: &mut AppState) {
 		let mut idx_counter: usize = self.args.idx_start;
 		// iterate through all globs
 		for glob in &self.args.sources {
 			debug!("Matching pattern '{}'", glob);
-			let paths = self.find_matches(glob).expect("Error extracting source files");
+			let paths = self.find_matches(glob, app_state).expect("Error extracting source files");
 
-			self.apply_matches(&paths, &mut idx_counter);
+			self.apply_matches(&paths, &mut idx_counter, app_state);
 
 			if self.args.mode == Mode::Move && self.args.delete_empty_dirs {
 				self.cleanup_empty_dirs(&paths);
@@ -533,14 +584,21 @@ impl<'a> App<'a> {
 		}
 	}
 
-	fn apply_matches(&self, paths: &Vec<PathBuf>, idx_counter: &mut usize) {
+	fn apply_matches(&self, paths: &Vec<PathBuf>, idx_counter: &mut usize, app_state: &mut AppState) {
 		// for each file matching the current glob
 		for src_path in paths.iter() {
 			// extract properties as a String -> Value map
 			let mut data = serde_json::value::Map::new();
-			self.extract_properties(src_path, |key, value| {
-				let value_as_string = self.attr_formatter.as_string(value);
-				data.insert(key.to_owned(), Value::String(value_as_string));
+			self.extract_properties(src_path, app_state, |key, value, app_state| {
+				match self.attr_formatter.as_string(value) {
+					Ok(value_as_string) => {
+						data.insert(key.to_owned(), Value::String(value_as_string));
+					}
+					Err(e) => {
+						error!("Cannot convert {:?} to string: {}", value, e);
+						app_state.report_error();
+					}
+				}
 			});
 			data.insert(
 				with_sys_prefix!("Idx").to_string(),
@@ -551,14 +609,21 @@ impl<'a> App<'a> {
 			match self.handlebars.render(DESTINATION_TEMPLATE_ID, &data) {
 				Ok(dest) => {
 					let dest_path = PathBuf::from(dest);
-					self.apply_mode(self.args.mode, src_path, &dest_path, &data);
+					self.apply_mode(self.args.mode, src_path, &dest_path, &data, app_state);
 				}
 				Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
 			}
 		}
 	}
 
-	fn apply_mode(&self, mode: Mode, src: &PathBuf, dest: &PathBuf, data: &Map<String, Value>) {
+	fn apply_mode(
+		&self,
+		mode: Mode,
+		src: &PathBuf,
+		dest: &PathBuf,
+		data: &Map<String, Value>,
+		app_state: &mut AppState,
+	) {
 		if self.args.verbose {
 			println!("{} {:?} {:?}", mode, src, dest);
 		}
@@ -566,6 +631,7 @@ impl<'a> App<'a> {
 		if self.args.mode != Mode::Info {
 			if same_file::is_same_file(src, dest).unwrap_or(false) {
 				warn!("Source and destination file are the same, skipping");
+				app_state.report_warning();
 				return;
 			}
 
@@ -573,10 +639,12 @@ impl<'a> App<'a> {
 				if self.args.force {
 					if let Err(e) = fs::remove_file(dest) {
 						error!("Destination exists, and --force specified, but could not remove: {}", e);
+						app_state.report_error();
 						return;
 					}
 				} else {
 					warn!("Destination file exists, skipping. Use --force to overwrite");
+					app_state.report_warning();
 					return;
 				}
 			}
@@ -590,6 +658,7 @@ impl<'a> App<'a> {
 				if !parent.exists() {
 					if let Err(e) = fs::create_dir_all(parent) {
 						error!("Could not create containing directory {:?}: {}", parent, e);
+						app_state.report_error();
 						return;
 					}
 				}
@@ -601,10 +670,12 @@ impl<'a> App<'a> {
 			Mode::Move =>
 				if let Err(e) = fs::rename(src, dest) {
 					error!("Could not rename {:?}: {}", src, e);
+					app_state.report_error();
 				},
 			Mode::Copy =>
 				if let Err(e) = fs::copy(src, dest) {
 					error!("Could not copy {:?}: {}", src, e);
+					app_state.report_error();
 				},
 			Mode::SymLink => {
 				// if src is absolute, we use the absolute path no matter what
@@ -633,11 +704,13 @@ impl<'a> App<'a> {
 					// this is deprecated, but we are sure we are linking files rather than
 					// directories, so there is no need to call the os-dependent version
 					error!("Could not symlink {:?}: {}", src, e);
+					app_state.report_error();
 				}
 			}
 			Mode::HardLink =>
 				if let Err(e) = fs::hard_link(src, dest) {
 					error!("Could not hard link {:?}: {}", src, e);
+					app_state.report_error();
 				},
 			// if "-m info" is enabled, display the data contained in the properties table
 			Mode::Info =>
@@ -670,6 +743,10 @@ fn main() {
 
 	init_config(log_config.expect("Invalid log configuration")).expect("Unable to initialize log4rs");
 
+	let mut report = AppState::default();
 	let app = App::new(Args::parse()).expect("Invalid arguments");
-	app.run();
+	app.run(&mut report);
+	if report.has_errors_or_warnings() {
+		warn!("{} errors, {} warnings", report.error_count(), report.warning_count());
+	}
 }
