@@ -62,6 +62,9 @@ The metadata listed here can be used to determine a destination name when copyin
 ```bash
 exif-namer -m info /media/nico/D9F7-3979/DCIM/100MSDCF/DSC04696.ARW
 ```
+
+Output:
+```
 {{ExifArtist}} "Nico_Orru"
 {{ExifBitsPerSample}} "8"
 {{ExifBrightnessValue}} "21134_2560"
