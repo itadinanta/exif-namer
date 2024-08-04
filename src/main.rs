@@ -468,6 +468,12 @@ impl<'a> App<'a> {
 			}
 		}
 
+		add_property(
+			app_state,
+			prepend!(SYS_PREFIX, "Uuid"),
+			&PropertyValue::from_opt_str(Some(&uuid::Uuid::new_v4().to_string())),
+		);
+
 		if !self.args.no_exif {
 			// File content - Exif properties
 			let exif_file = fs::File::open(src);

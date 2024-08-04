@@ -1,6 +1,6 @@
 [package]
 name = "exif-namer"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 keywords = ["exif", "copy", "move", "link", "rename"]
 description = "Utility to bulk copy/link/rename image and other media file sets"
