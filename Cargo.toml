@@ -2,6 +2,11 @@
 name = "exif-namer"
 version = "0.1.0"
 edition = "2021"
+keywords = ["exif", "copy", "move", "link", "rename"]
+description = "Utility to bulk copy/link/rename image and other media file sets"
+repository = "https://github.com/itadinanta/exif-namer"
+license = "Apache-2.0"
+publish = true # insurance against accidents
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
