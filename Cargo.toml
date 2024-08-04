@@ -6,7 +6,7 @@ keywords = ["exif", "copy", "move", "link", "rename"]
 description = "Utility to bulk copy/link/rename image and other media file sets"
 repository = "https://github.com/itadinanta/exif-namer"
 license = "Apache-2.0"
-publish = true # insurance against accidents
+publish = false # insurance against accidents
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
