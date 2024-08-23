@@ -4,9 +4,11 @@ use clap::{Parser, ValueEnum};
 use const_format::concatcp;
 use exif::In;
 use glob::*;
+use handlebars::handlebars_helper;
 use handlebars_misc_helpers::{env_helpers, path_helpers, regex_helpers, string_helpers};
 use log::*;
 use log4rs::append::console::{ConsoleAppender, Target};
+use num;
 use serde_json::value::*;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeSet;
@@ -312,6 +314,16 @@ impl<'a> App<'a> {
 		handlebars.set_prevent_indent(true);
 		handlebars.set_strict_mode(!args.no_strict);
 		handlebars.register_escape_fn(handlebars::no_escape);
+		{
+			handlebars_helper!(substr: |v: str, from: usize, len: usize | {
+				let l= v.len();
+				let start = num::clamp(from, 0, l);
+				let end = num::clamp(from + len, start, l);
+				v[start..end].to_owned()
+			});
+			handlebars.register_helper("substr", Box::new(substr))
+		}
+
 		string_helpers::register(&mut handlebars);
 		regex_helpers::register(&mut handlebars);
 		path_helpers::register(&mut handlebars);
