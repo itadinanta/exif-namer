@@ -2,6 +2,7 @@ use chrono::{DateTime, Local, NaiveDateTime};
 use clap::builder::PossibleValue;
 use clap::{Parser, ValueEnum};
 use const_format::concatcp;
+use digest_io::IoWrapper;
 use exif::In;
 use glob::*;
 use handlebars::handlebars_helper;
@@ -30,7 +31,9 @@ enum Mode {
 }
 
 impl Default for Mode {
-	fn default() -> Self { Self::Move }
+	fn default() -> Self {
+		Self::Move
+	}
 }
 
 impl fmt::Display for Mode {
@@ -40,7 +43,9 @@ impl fmt::Display for Mode {
 }
 
 impl ValueEnum for Mode {
-	fn value_variants<'a>() -> &'a [Self] { &[Self::Move, Self::Copy, Self::SymLink, Self::HardLink, Self::Info] }
+	fn value_variants<'a>() -> &'a [Self] {
+		&[Self::Move, Self::Copy, Self::SymLink, Self::HardLink, Self::Info]
+	}
 
 	fn to_possible_value(&self) -> Option<PossibleValue> {
 		Some(match self {
@@ -144,11 +149,15 @@ trait Pair<I> {
 }
 
 impl Pair<u32> for exif::Rational {
-	fn as_pair(&self) -> (u32, u32) { (self.num, self.denom) }
+	fn as_pair(&self) -> (u32, u32) {
+		(self.num, self.denom)
+	}
 }
 
 impl Pair<i32> for exif::SRational {
-	fn as_pair(&self) -> (i32, i32) { (self.num, self.denom) }
+	fn as_pair(&self) -> (i32, i32) {
+		(self.num, self.denom)
+	}
 }
 
 impl PropertyValue {
@@ -180,7 +189,9 @@ impl PropertyValue {
 	}
 
 	fn from_opt_integer<T>(from: Option<&T>) -> Self
-	where T: Into<i64> + Copy {
+	where
+		T: Into<i64> + Copy,
+	{
 		match from {
 			Some(n) => PropertyValue::Integer((*n).into()),
 			None => PropertyValue::Nothing,
@@ -188,7 +199,9 @@ impl PropertyValue {
 	}
 
 	fn from_opt_real<T>(from: Option<&T>) -> Self
-	where T: Into<f64> + Copy {
+	where
+		T: Into<f64> + Copy,
+	{
 		match from {
 			Some(v) => PropertyValue::Real((*v).into()),
 			None => PropertyValue::Nothing,
@@ -198,7 +211,8 @@ impl PropertyValue {
 	fn from_opt_rational<T, U>(from: Option<&T>) -> Self
 	where
 		T: Pair<U>,
-		U: Into<i64> + Copy, {
+		U: Into<i64> + Copy,
+	{
 		match from {
 			Some(r) => {
 				let (n, d) = r.as_pair();
@@ -242,13 +256,16 @@ impl ExifAttrFormatter {
 	}
 
 	fn fmt<W>(&self, value: &PropertyValue, f: &mut W) -> fmt::Result
-	where W: Write {
+	where
+		W: Write,
+	{
 		match value {
 			// write!(f, "{}", strings)
 			PropertyValue::Text(ref text) => f.write_str(text),
 			PropertyValue::Path(ref path) => f.write_str(path.to_str().unwrap_or("")),
-			PropertyValue::Timestamp(ref timestamp) =>
-				f.write_str(&timestamp.format(&self.date_time_format).to_string()),
+			PropertyValue::Timestamp(ref timestamp) => {
+				f.write_str(&timestamp.format(&self.date_time_format).to_string())
+			}
 			PropertyValue::Integer(ref value) => write!(f, "{}", value),
 			PropertyValue::Fraction(ref num, ref den) => write!(f, "{}_{}", num, den),
 			PropertyValue::Real(ref value) => write!(f, "{}", value),
@@ -260,7 +277,9 @@ impl ExifAttrFormatter {
 		self.sanitize_value_pattern.replace_all(value, &self.sanitize_replacement).to_string()
 	}
 
-	pub fn sanitize_key(&self, key: &String) -> String { self.sanitize_key_pattern.replace_all(key, "").to_string() }
+	pub fn sanitize_key(&self, key: &String) -> String {
+		self.sanitize_key_pattern.replace_all(key, "").to_string()
+	}
 
 	pub fn as_string(&self, value: &PropertyValue) -> Result<String, fmt::Error> {
 		let mut value_as_string = String::new();
@@ -278,11 +297,21 @@ struct AppState {
 }
 
 impl AppState {
-	fn report_error(&mut self) { self.error_count += 1; }
-	fn report_warning(&mut self) { self.warning_count += 1; }
-	fn error_count(&self) -> usize { self.error_count }
-	fn warning_count(&self) -> usize { self.warning_count }
-	fn has_errors_or_warnings(&self) -> bool { self.error_count > 0 || self.warning_count > 0 }
+	fn report_error(&mut self) {
+		self.error_count += 1;
+	}
+	fn report_warning(&mut self) {
+		self.warning_count += 1;
+	}
+	fn error_count(&self) -> usize {
+		self.error_count
+	}
+	fn warning_count(&self) -> usize {
+		self.warning_count
+	}
+	fn has_errors_or_warnings(&self) -> bool {
+		self.error_count > 0 || self.warning_count > 0
+	}
 }
 
 struct App<'a> {
@@ -341,10 +370,11 @@ impl<'a> App<'a> {
 		let mut out = Vec::new();
 		for iter in glob::glob(pattern)? {
 			match iter {
-				Ok(path) =>
+				Ok(path) => {
 					if path.is_file() {
 						out.push(path)
-					},
+					}
+				}
 				Err(e) => {
 					error!("Invalid glob pattern {}: {}", pattern, e);
 					reporter.report_error();
@@ -355,7 +385,9 @@ impl<'a> App<'a> {
 	}
 
 	fn extract_properties<F>(&self, app_state: &mut AppState, src: &PathBuf, mut add_property: F)
-	where F: FnMut(&mut AppState, &str, &PropertyValue) {
+	where
+		F: FnMut(&mut AppState, &str, &PropertyValue),
+	{
 		// global properties
 
 		add_property(
@@ -463,13 +495,13 @@ impl<'a> App<'a> {
 		if !self.args.no_sha1 {
 			// File content - Sha1 properties
 			if let Ok(mut file) = fs::File::open(&src) {
-				let mut hasher = Sha1::new();
+				let mut hasher = IoWrapper(Sha1::new());
 				match io::copy(&mut file, &mut hasher) {
 					Ok(_) => {
 						add_property(
 							app_state,
 							&prepend!(SYS_PREFIX, "Sha1"),
-							&PropertyValue::Text(hex::encode(hasher.finalize())),
+							&PropertyValue::Text(hex::encode(hasher.0.finalize())),
 						);
 					}
 					Err(e) => {
@@ -687,16 +719,18 @@ impl<'a> App<'a> {
 
 		#[allow(deprecated)]
 		match self.args.mode {
-			Mode::Move =>
+			Mode::Move => {
 				if let Err(e) = fs::rename(src, dest) {
 					error!("Could not rename {:?}: {}", src, e);
 					app_state.report_error();
-				},
-			Mode::Copy =>
+				}
+			}
+			Mode::Copy => {
 				if let Err(e) = fs::copy(src, dest) {
 					error!("Could not copy {:?}: {}", src, e);
 					app_state.report_error();
-				},
+				}
+			}
 			Mode::SymLink => {
 				// if src is absolute, we use the absolute path no matter what
 				let target = if src.is_absolute() {
@@ -727,13 +761,14 @@ impl<'a> App<'a> {
 					app_state.report_error();
 				}
 			}
-			Mode::HardLink =>
+			Mode::HardLink => {
 				if let Err(e) = fs::hard_link(src, dest) {
 					error!("Could not hard link {:?}: {}", src, e);
 					app_state.report_error();
-				},
+				}
+			}
 			// if "-m info" is enabled, display the data contained in the properties table
-			Mode::Info =>
+			Mode::Info => {
 				for (key, value) in data {
 					let value_as_str = value.as_str().expect("The data table should only contain strings");
 					let len = value_as_str.len();
@@ -748,7 +783,8 @@ impl<'a> App<'a> {
 					} else {
 						println!("{{{{{}}}}} \"{}\"", key, value_as_str);
 					}
-				},
+				}
+			}
 		}
 	}
 }
