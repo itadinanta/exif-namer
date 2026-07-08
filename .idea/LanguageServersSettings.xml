@@ -11,6 +11,15 @@
             </LanguageServerDefinitionSettings>
           </value>
         </entry>
+        <entry key="c86cb3a7-dbb2-4ba4-ac7d-e0807e1da265">
+          <value>
+            <LanguageServerDefinitionSettings>
+              <option name="debugPort" value="" />
+              <option name="errorReportingKind" value="as_notification" />
+              <option name="serverTrace" value="messages" />
+            </LanguageServerDefinitionSettings>
+          </value>
+        </entry>
       </map>
     </state>
   </component>
