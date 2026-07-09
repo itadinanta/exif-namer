@@ -9,7 +9,6 @@ use handlebars::handlebars_helper;
 use handlebars_misc_helpers::{env_helpers, path_helpers, regex_helpers, string_helpers};
 use log::*;
 use log4rs::append::console::{ConsoleAppender, Target};
-use num;
 use serde_json::value::*;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeSet;
@@ -21,19 +20,14 @@ use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 use std::{fmt, fs};
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 enum Mode {
+	#[default]
 	Move,
 	Copy,
 	SymLink,
 	HardLink,
 	Info,
-}
-
-impl Default for Mode {
-	fn default() -> Self {
-		Self::Move
-	}
 }
 
 impl fmt::Display for Mode {
@@ -273,17 +267,17 @@ impl ExifAttrFormatter {
 		}
 	}
 
-	fn sanitize_value(&self, value: &String) -> String {
+	fn sanitize_value(&self, value: &str) -> String {
 		self.sanitize_value_pattern.replace_all(value, &self.sanitize_replacement).to_string()
 	}
 
-	pub fn sanitize_key(&self, key: &String) -> String {
+	pub fn sanitize_key(&self, key: &str) -> String {
 		self.sanitize_key_pattern.replace_all(key, "").to_string()
 	}
 
 	pub fn as_string(&self, value: &PropertyValue) -> Result<String, fmt::Error> {
 		let mut value_as_string = String::new();
-		self.fmt(&value, &mut value_as_string)?;
+		self.fmt(value, &mut value_as_string)?;
 		match value {
 			PropertyValue::Path(_) => Ok(value_as_string),
 			_ => Ok(self.sanitize_value(&value_as_string)),
@@ -322,9 +316,9 @@ struct App<'a> {
 	handlebars: handlebars::Handlebars<'a>,
 }
 
-const EXIF_PREFIX: &'static str = "Exif";
-const EXIFTN_PREFIX: &'static str = "ExifTn";
-const SYS_PREFIX: &'static str = "Sys";
+const EXIF_PREFIX: &str = "Exif";
+const EXIFTN_PREFIX: &str = "ExifTn";
+const SYS_PREFIX: &str = "Sys";
 
 macro_rules! prepend {
 	($prefix:tt, $name:expr) => {
@@ -332,7 +326,7 @@ macro_rules! prepend {
 	};
 }
 
-const DESTINATION_TEMPLATE_ID: &'static str = "destination";
+const DESTINATION_TEMPLATE_ID: &str = "destination";
 
 impl<'a> App<'a> {
 	fn new(args: Args) -> Result<Self, regex::Error> {
@@ -393,7 +387,7 @@ impl<'a> App<'a> {
 		add_property(
 			// extension without the leading dot
 			app_state,
-			&prepend!(SYS_PREFIX, "DateTimeNow"),
+			prepend!(SYS_PREFIX, "DateTimeNow"),
 			&PropertyValue::Timestamp(self.now.naive_local()),
 		);
 		add_property(
@@ -494,13 +488,13 @@ impl<'a> App<'a> {
 
 		if !self.args.no_sha1 {
 			// File content - Sha1 properties
-			if let Ok(mut file) = fs::File::open(&src) {
+			if let Ok(mut file) = fs::File::open(src) {
 				let mut hasher = IoWrapper(Sha1::new());
 				match io::copy(&mut file, &mut hasher) {
 					Ok(_) => {
 						add_property(
 							app_state,
-							&prepend!(SYS_PREFIX, "Sha1"),
+							prepend!(SYS_PREFIX, "Sha1"),
 							&PropertyValue::Text(hex::encode(hasher.0.finalize())),
 						);
 					}
@@ -537,7 +531,7 @@ impl<'a> App<'a> {
 							let value = match f.value {
 								exif::Value::Byte(ref n) => PropertyValue::from_opt_integer(n.first()),
 								exif::Value::Ascii(ref text) => {
-									let src = text.first().map(|v| std::str::from_utf8(&*v)).and_then(Result::ok);
+									let src = text.first().map(|v| std::str::from_utf8(v)).and_then(Result::ok);
 									match f.tag {
 										exif::Tag::DateTime
 										| exif::Tag::DateTimeOriginal
@@ -615,7 +609,7 @@ impl<'a> App<'a> {
 		false
 	}
 
-	fn cleanup_empty_dirs(&self, paths: &Vec<PathBuf>) {
+	fn cleanup_empty_dirs(&self, paths: &[PathBuf]) {
 		let mut candidate_paths = BTreeSet::new();
 
 		for src_path in paths.iter() {
@@ -636,7 +630,7 @@ impl<'a> App<'a> {
 		}
 	}
 
-	fn apply_matches(&self, app_state: &mut AppState, paths: &Vec<PathBuf>, idx_counter: &mut usize) {
+	fn apply_matches(&self, app_state: &mut AppState, paths: &[PathBuf], idx_counter: &mut usize) {
 		// for each file matching the current glob
 		for src_path in paths.iter() {
 			// extract properties as a String -> Value map
