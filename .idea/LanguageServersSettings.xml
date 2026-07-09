@@ -16,7 +16,7 @@
             <LanguageServerDefinitionSettings>
               <option name="debugPort" value="" />
               <option name="errorReportingKind" value="as_notification" />
-              <option name="serverTrace" value="messages" />
+              <option name="serverTrace" value="off" />
             </LanguageServerDefinitionSettings>
           </value>
         </entry>

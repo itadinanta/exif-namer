@@ -381,7 +381,7 @@ impl<'a> App<'a> {
 				}
 			}
 		}
-		return Ok(out);
+		Ok(out)
 	}
 
 	fn extract_properties<F>(&self, app_state: &mut AppState, src: &PathBuf, mut add_property: F)
@@ -612,7 +612,7 @@ impl<'a> App<'a> {
 				}
 			}
 		}
-		return false;
+		false
 	}
 
 	fn cleanup_empty_dirs(&self, paths: &Vec<PathBuf>) {
@@ -640,7 +640,7 @@ impl<'a> App<'a> {
 		// for each file matching the current glob
 		for src_path in paths.iter() {
 			// extract properties as a String -> Value map
-			let mut data = serde_json::value::Map::new();
+			let mut data = Map::new();
 			data.insert(
 				prepend!(SYS_PREFIX, "Idx").to_string(),
 				Value::String(format!("{:01$}", idx_counter, self.args.idx_width)),
