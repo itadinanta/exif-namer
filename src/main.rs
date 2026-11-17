@@ -8,7 +8,6 @@ use handlebars::handlebars_helper;
 use handlebars_misc_helpers::{env_helpers, path_helpers, regex_helpers, string_helpers};
 use log::*;
 use log4rs::append::console::{ConsoleAppender, Target};
-use num;
 use serde_json::value::*;
 use sha1::{Digest, Sha1};
 use std::collections::BTreeSet;
@@ -20,6 +19,8 @@ use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 use std::{fmt, fs};
 
+mod cr3;
+
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 enum Mode {
 	Move,
@@ -29,18 +30,19 @@ enum Mode {
 	Info,
 }
 
-impl Default for Mode {
-	fn default() -> Self { Self::Move }
-}
-
 impl fmt::Display for Mode {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		self.to_possible_value().expect("no values are skipped").get_name().fmt(f)
+		self.to_possible_value()
+			.expect("no values are skipped")
+			.get_name()
+			.fmt(f)
 	}
 }
 
 impl ValueEnum for Mode {
-	fn value_variants<'a>() -> &'a [Self] { &[Self::Move, Self::Copy, Self::SymLink, Self::HardLink, Self::Info] }
+	fn value_variants<'a>() -> &'a [Self] {
+		&[Self::Move, Self::Copy, Self::SymLink, Self::HardLink, Self::Info]
+	}
 
 	fn to_possible_value(&self) -> Option<PossibleValue> {
 		Some(match self {
@@ -54,7 +56,10 @@ impl ValueEnum for Mode {
 }
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Bulk rename large collections of images using Exif and OS data in the destination names")]
+#[command(
+	version,
+	about = "Bulk rename large collections of images using Exif and OS data in the destination names"
+)]
 struct Args {
 	#[arg(help = "A list of glob patterns, each identifying a set of files to inspect and rename")]
 	sources: Vec<String>,
@@ -83,10 +88,20 @@ struct Args {
 	#[arg(short, long, default_value_t = false, help = "Log more debugging information.")]
 	verbose: bool,
 
-	#[arg(short = 'n', long, default_value_t = false, help = "Do not apply any changes to the filesystem")]
+	#[arg(
+		short = 'n',
+		long,
+		default_value_t = false,
+		help = "Do not apply any changes to the filesystem"
+	)]
 	dry_run: bool,
 
-	#[arg(short, long, default_value_t = false, help = "Force overwrite if destination file exists")]
+	#[arg(
+		short,
+		long,
+		default_value_t = false,
+		help = "Force overwrite if destination file exists"
+	)]
 	force: bool,
 
 	#[arg(long, default_value_t = false, help = "Disable Handlebars strict mode")]
@@ -98,7 +113,11 @@ struct Args {
 	#[arg(long, default_value_t = false, help = "Disable exif parsing")]
 	no_exif: bool,
 
-	#[arg(long, default_value_t = false, help = "When moving files, delete the source folder if empty")]
+	#[arg(
+		long,
+		default_value_t = false,
+		help = "When moving files, delete the source folder if empty"
+	)]
 	delete_empty_dirs: bool,
 
 	#[arg(
@@ -108,7 +127,11 @@ struct Args {
 	)]
 	force_absolute_symlinks: bool,
 
-	#[arg(long, default_value_t = 100, help = "Truncate long values in -m info. Set to 0 for infinite length")]
+	#[arg(
+		long,
+		default_value_t = 100,
+		help = "Truncate long values in -m info. Set to 0 for infinite length"
+	)]
 	max_display_len: usize,
 
 	#[arg(long, default_value_t = 0, help = "Index counter start")]
@@ -124,7 +147,11 @@ struct Args {
 	)]
 	invalid_characters: String,
 
-	#[arg(long, default_value = "_", help = "Replacement for invalid characters or sequences in properties")]
+	#[arg(
+		long,
+		default_value = "_",
+		help = "Replacement for invalid characters or sequences in properties"
+	)]
 	replacement: String,
 }
 
@@ -144,11 +171,15 @@ trait Pair<I> {
 }
 
 impl Pair<u32> for exif::Rational {
-	fn as_pair(&self) -> (u32, u32) { (self.num, self.denom) }
+	fn as_pair(&self) -> (u32, u32) {
+		(self.num, self.denom)
+	}
 }
 
 impl Pair<i32> for exif::SRational {
-	fn as_pair(&self) -> (i32, i32) { (self.num, self.denom) }
+	fn as_pair(&self) -> (i32, i32) {
+		(self.num, self.denom)
+	}
 }
 
 impl PropertyValue {
@@ -180,7 +211,9 @@ impl PropertyValue {
 	}
 
 	fn from_opt_integer<T>(from: Option<&T>) -> Self
-	where T: Into<i64> + Copy {
+	where
+		T: Into<i64> + Copy,
+	{
 		match from {
 			Some(n) => PropertyValue::Integer((*n).into()),
 			None => PropertyValue::Nothing,
@@ -188,7 +221,9 @@ impl PropertyValue {
 	}
 
 	fn from_opt_real<T>(from: Option<&T>) -> Self
-	where T: Into<f64> + Copy {
+	where
+		T: Into<f64> + Copy,
+	{
 		match from {
 			Some(v) => PropertyValue::Real((*v).into()),
 			None => PropertyValue::Nothing,
@@ -198,7 +233,8 @@ impl PropertyValue {
 	fn from_opt_rational<T, U>(from: Option<&T>) -> Self
 	where
 		T: Pair<U>,
-		U: Into<i64> + Copy, {
+		U: Into<i64> + Copy,
+	{
 		match from {
 			Some(r) => {
 				let (n, d) = r.as_pair();
@@ -242,13 +278,16 @@ impl ExifAttrFormatter {
 	}
 
 	fn fmt<W>(&self, value: &PropertyValue, f: &mut W) -> fmt::Result
-	where W: Write {
+	where
+		W: Write,
+	{
 		match value {
 			// write!(f, "{}", strings)
 			PropertyValue::Text(ref text) => f.write_str(text),
 			PropertyValue::Path(ref path) => f.write_str(path.to_str().unwrap_or("")),
-			PropertyValue::Timestamp(ref timestamp) =>
-				f.write_str(&timestamp.format(&self.date_time_format).to_string()),
+			PropertyValue::Timestamp(ref timestamp) => {
+				f.write_str(&timestamp.format(&self.date_time_format).to_string())
+			}
 			PropertyValue::Integer(ref value) => write!(f, "{}", value),
 			PropertyValue::Fraction(ref num, ref den) => write!(f, "{}_{}", num, den),
 			PropertyValue::Real(ref value) => write!(f, "{}", value),
@@ -256,15 +295,19 @@ impl ExifAttrFormatter {
 		}
 	}
 
-	fn sanitize_value(&self, value: &String) -> String {
-		self.sanitize_value_pattern.replace_all(value, &self.sanitize_replacement).to_string()
+	fn sanitize_value(&self, value: &str) -> String {
+		self.sanitize_value_pattern
+			.replace_all(value, &self.sanitize_replacement)
+			.to_string()
 	}
 
-	pub fn sanitize_key(&self, key: &String) -> String { self.sanitize_key_pattern.replace_all(key, "").to_string() }
+	pub fn sanitize_key(&self, key: &str) -> String {
+		self.sanitize_key_pattern.replace_all(key, "").to_string()
+	}
 
 	pub fn as_string(&self, value: &PropertyValue) -> Result<String, fmt::Error> {
 		let mut value_as_string = String::new();
-		self.fmt(&value, &mut value_as_string)?;
+		self.fmt(value, &mut value_as_string)?;
 		match value {
 			PropertyValue::Path(_) => Ok(value_as_string),
 			_ => Ok(self.sanitize_value(&value_as_string)),
@@ -278,11 +321,21 @@ struct AppState {
 }
 
 impl AppState {
-	fn report_error(&mut self) { self.error_count += 1; }
-	fn report_warning(&mut self) { self.warning_count += 1; }
-	fn error_count(&self) -> usize { self.error_count }
-	fn warning_count(&self) -> usize { self.warning_count }
-	fn has_errors_or_warnings(&self) -> bool { self.error_count > 0 || self.warning_count > 0 }
+	fn report_error(&mut self) {
+		self.error_count += 1;
+	}
+	fn report_warning(&mut self) {
+		self.warning_count += 1;
+	}
+	fn error_count(&self) -> usize {
+		self.error_count
+	}
+	fn warning_count(&self) -> usize {
+		self.warning_count
+	}
+	fn has_errors_or_warnings(&self) -> bool {
+		self.error_count > 0 || self.warning_count > 0
+	}
 }
 
 struct App<'a> {
@@ -293,9 +346,9 @@ struct App<'a> {
 	handlebars: handlebars::Handlebars<'a>,
 }
 
-const EXIF_PREFIX: &'static str = "Exif";
-const EXIFTN_PREFIX: &'static str = "ExifTn";
-const SYS_PREFIX: &'static str = "Sys";
+const EXIF_PREFIX: &str = "Exif";
+const EXIFTN_PREFIX: &str = "ExifTn";
+const SYS_PREFIX: &str = "Sys";
 
 macro_rules! prepend {
 	($prefix:tt, $name:expr) => {
@@ -303,12 +356,15 @@ macro_rules! prepend {
 	};
 }
 
-const DESTINATION_TEMPLATE_ID: &'static str = "destination";
+const DESTINATION_TEMPLATE_ID: &str = "destination";
 
 impl<'a> App<'a> {
 	fn new(args: Args) -> Result<Self, regex::Error> {
-		let attr_formatter =
-			ExifAttrFormatter::new(args.timestamp_format.clone(), &args.invalid_characters, args.replacement.clone())?;
+		let attr_formatter = ExifAttrFormatter::new(
+			args.timestamp_format.clone(),
+			&args.invalid_characters,
+			args.replacement.clone(),
+		)?;
 		let mut handlebars = handlebars::Handlebars::new();
 		handlebars.set_dev_mode(true);
 		handlebars.set_prevent_indent(true);
@@ -334,34 +390,43 @@ impl<'a> App<'a> {
 			.map_err(|e| regex::Error::Syntax(format!("Handlebar syntax error in {}: {}", args.destination, e)))?;
 		let now = Local::now();
 		let cwd = std::env::current_dir().expect("Unable to determine current directory");
-		Ok(App { args, now, cwd, attr_formatter, handlebars })
+		Ok(App {
+			args,
+			now,
+			cwd,
+			attr_formatter,
+			handlebars,
+		})
 	}
 
 	fn find_matches(&self, pattern: &str, reporter: &mut AppState) -> Result<Vec<PathBuf>, PatternError> {
 		let mut out = Vec::new();
 		for iter in glob::glob(pattern)? {
 			match iter {
-				Ok(path) =>
+				Ok(path) => {
 					if path.is_file() {
 						out.push(path)
-					},
+					}
+				}
 				Err(e) => {
 					error!("Invalid glob pattern {}: {}", pattern, e);
 					reporter.report_error();
 				}
 			}
 		}
-		return Ok(out);
+		Ok(out)
 	}
 
 	fn extract_properties<F>(&self, app_state: &mut AppState, src: &PathBuf, mut add_property: F)
-	where F: FnMut(&mut AppState, &str, &PropertyValue) {
+	where
+		F: FnMut(&mut AppState, &str, &PropertyValue),
+	{
 		// global properties
 
 		add_property(
 			// extension without the leading dot
 			app_state,
-			&prepend!(SYS_PREFIX, "DateTimeNow"),
+			prepend!(SYS_PREFIX, "DateTimeNow"),
 			&PropertyValue::Timestamp(self.now.naive_local()),
 		);
 		add_property(
@@ -400,7 +465,11 @@ impl<'a> App<'a> {
 			&PropertyValue::from_opt_path(src.file_name()),
 		);
 		let parent = src.parent();
-		add_property(app_state, prepend!(SYS_PREFIX, "Path"), &PropertyValue::from_opt_path(parent));
+		add_property(
+			app_state,
+			prepend!(SYS_PREFIX, "Path"),
+			&PropertyValue::from_opt_path(parent),
+		);
 		let mut path_head = PathBuf::new();
 		let components = src.components().collect::<Vec<_>>();
 		let n_components = components.len();
@@ -452,7 +521,11 @@ impl<'a> App<'a> {
 					prepend!(SYS_PREFIX, "DateTimeAccessed"),
 					&PropertyValue::from_opt_filetime(metadata.accessed().ok()),
 				);
-				add_property(app_state, prepend!(SYS_PREFIX, "Size"), &PropertyValue::Integer(metadata.len() as i64));
+				add_property(
+					app_state,
+					prepend!(SYS_PREFIX, "Size"),
+					&PropertyValue::Integer(metadata.len() as i64),
+				);
 			}
 			Err(e) => {
 				error!("Unable to read fs metadata for {:?}: {}", src, e);
@@ -462,13 +535,13 @@ impl<'a> App<'a> {
 
 		if !self.args.no_sha1 {
 			// File content - Sha1 properties
-			if let Ok(mut file) = fs::File::open(&src) {
+			if let Ok(mut file) = fs::File::open(src) {
 				let mut hasher = Sha1::new();
 				match io::copy(&mut file, &mut hasher) {
 					Ok(_) => {
 						add_property(
 							app_state,
-							&prepend!(SYS_PREFIX, "Sha1"),
+							prepend!(SYS_PREFIX, "Sha1"),
 							&PropertyValue::Text(hex::encode(hasher.finalize())),
 						);
 					}
@@ -492,20 +565,28 @@ impl<'a> App<'a> {
 			match exif_file {
 				Ok(file) => {
 					let mut buf_reader = io::BufReader::new(&file);
-					let exif_reader = exif::Reader::new();
-					if let Ok(exif) = exif_reader.read_from_container(&mut buf_reader) {
-						for f in exif.fields() {
+					// Upstream container sniffing rejects CR3, so route those through the local module.
+					let exif_fields: Option<Vec<exif::Field>> = if cr3::is_cr3(&mut buf_reader) {
+						cr3::read_fields(&mut buf_reader).ok()
+					} else {
+						exif::Reader::new()
+							.read_from_container(&mut buf_reader)
+							.ok()
+							.map(|exif| exif.fields().cloned().collect())
+					};
+					if let Some(exif_fields) = exif_fields {
+						for f in &exif_fields {
 							debug!(
 								"{:30} {:50} {:10} {:.50}",
 								f.tag,
 								f.tag.description().unwrap_or(""),
 								f.ifd_num,
-								f.display_value().with_unit(&exif).to_string()
+								f.display_value().to_string()
 							);
 							let value = match f.value {
 								exif::Value::Byte(ref n) => PropertyValue::from_opt_integer(n.first()),
 								exif::Value::Ascii(ref text) => {
-									let src = text.first().map(|v| std::str::from_utf8(&*v)).and_then(Result::ok);
+									let src = text.first().map(|v| std::str::from_utf8(v)).and_then(Result::ok);
 									match f.tag {
 										exif::Tag::DateTime
 										| exif::Tag::DateTimeOriginal
@@ -544,7 +625,9 @@ impl<'a> App<'a> {
 		// iterate through all globs
 		for glob in &self.args.sources {
 			debug!("Matching pattern '{}'", glob);
-			let paths = self.find_matches(glob, &mut app_state).expect("Error extracting source files");
+			let paths = self
+				.find_matches(glob, &mut app_state)
+				.expect("Error extracting source files");
 
 			self.apply_matches(&mut app_state, &paths, &mut idx_counter);
 
@@ -580,10 +663,10 @@ impl<'a> App<'a> {
 				}
 			}
 		}
-		return false;
+		false
 	}
 
-	fn cleanup_empty_dirs(&self, paths: &Vec<PathBuf>) {
+	fn cleanup_empty_dirs(&self, paths: &[PathBuf]) {
 		let mut candidate_paths = BTreeSet::new();
 
 		for src_path in paths.iter() {
@@ -604,7 +687,7 @@ impl<'a> App<'a> {
 		}
 	}
 
-	fn apply_matches(&self, app_state: &mut AppState, paths: &Vec<PathBuf>, idx_counter: &mut usize) {
+	fn apply_matches(&self, app_state: &mut AppState, paths: &[PathBuf], idx_counter: &mut usize) {
 		// for each file matching the current glob
 		for src_path in paths.iter() {
 			// extract properties as a String -> Value map
@@ -687,16 +770,18 @@ impl<'a> App<'a> {
 
 		#[allow(deprecated)]
 		match self.args.mode {
-			Mode::Move =>
+			Mode::Move => {
 				if let Err(e) = fs::rename(src, dest) {
 					error!("Could not rename {:?}: {}", src, e);
 					app_state.report_error();
-				},
-			Mode::Copy =>
+				}
+			}
+			Mode::Copy => {
 				if let Err(e) = fs::copy(src, dest) {
 					error!("Could not copy {:?}: {}", src, e);
 					app_state.report_error();
-				},
+				}
+			}
 			Mode::SymLink => {
 				// if src is absolute, we use the absolute path no matter what
 				let target = if src.is_absolute() {
@@ -709,7 +794,10 @@ impl<'a> App<'a> {
 						src_absolute
 					} else if let Some(src_relative) = pathdiff::diff_paths(
 						&src_absolute,
-						std::path::absolute(dest).unwrap_or_else(|_| self.cwd.join(dest)).parent().unwrap(),
+						std::path::absolute(dest)
+							.unwrap_or_else(|_| self.cwd.join(dest))
+							.parent()
+							.unwrap(),
 					) {
 						if self.args.verbose {
 							println!("# -> {:?}", src_relative);
@@ -727,13 +815,14 @@ impl<'a> App<'a> {
 					app_state.report_error();
 				}
 			}
-			Mode::HardLink =>
+			Mode::HardLink => {
 				if let Err(e) = fs::hard_link(src, dest) {
 					error!("Could not hard link {:?}: {}", src, e);
 					app_state.report_error();
-				},
+				}
+			}
 			// if "-m info" is enabled, display the data contained in the properties table
-			Mode::Info =>
+			Mode::Info => {
 				for (key, value) in data {
 					let value_as_str = value.as_str().expect("The data table should only contain strings");
 					let len = value_as_str.len();
@@ -748,7 +837,8 @@ impl<'a> App<'a> {
 					} else {
 						println!("{{{{{}}}}} \"{}\"", key, value_as_str);
 					}
-				},
+				}
+			}
 		}
 	}
 }
@@ -756,8 +846,10 @@ impl<'a> App<'a> {
 fn main() -> ExitCode {
 	// Hardcoded log4rs to avoid loading a config file
 	use log4rs::config::*;
-	let log_appender = Appender::builder()
-		.build("stderr".to_string(), Box::new(ConsoleAppender::builder().target(Target::Stderr).build()));
+	let log_appender = Appender::builder().build(
+		"stderr".to_string(),
+		Box::new(ConsoleAppender::builder().target(Target::Stderr).build()),
+	);
 	let log_root = Root::builder().appender("stderr".to_string()).build(LevelFilter::Info);
 	let log_config = Config::builder().appender(log_appender).build(log_root);
 	init_config(log_config.expect("Invalid log configuration")).expect("Unable to initialize log4rs");
@@ -768,7 +860,11 @@ fn main() -> ExitCode {
 
 	// Report run status
 	if report.has_errors_or_warnings() {
-		warn!("{} error(s), {} warning(s)", report.error_count(), report.warning_count());
+		warn!(
+			"{} error(s), {} warning(s)",
+			report.error_count(),
+			report.warning_count()
+		);
 		ExitCode::FAILURE
 	} else {
 		ExitCode::SUCCESS

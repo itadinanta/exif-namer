@@ -13,14 +13,19 @@ fn read_container(path: &str) -> Result<Exif, exif::Error> {
 }
 
 fn display(exif: &Exif, tag: exif::Tag) -> Option<String> {
-	exif.fields().find(|f| f.tag == tag).map(|f| f.display_value().to_string())
+	exif.fields()
+		.find(|f| f.tag == tag)
+		.map(|f| f.display_value().to_string())
 }
 
 /// CR2 is TIFF-based, so the upstream container sniffing handles it.
 #[test]
 fn cr2_yields_datetime_original() {
 	let exif = read_container(CR2).expect("CR2 parses");
-	assert_eq!(display(&exif, exif::Tag::DateTimeOriginal).as_deref(), Some("2024-08-15 01:07:58"));
+	assert_eq!(
+		display(&exif, exif::Tag::DateTimeOriginal).as_deref(),
+		Some("2024-08-15 01:07:58")
+	);
 }
 
 #[test]
@@ -40,9 +45,10 @@ fn cr2_field_count_is_in_expected_range() {
 	assert!(exif.fields().count() > 60, "unexpectedly few fields");
 }
 
-/// Documents the remaining gap: CR3 is an ISOBMFF container with the EXIF data
-/// split across separate `CMT*` boxes, which upstream rejects outright.
-/// Invert or replace this test once CR3 support lands.
+/// Documents upstream's behaviour: CR3 is an ISOBMFF container with the EXIF
+/// data split across separate `CMT*` boxes, which upstream rejects outright.
+/// exif-namer handles CR3 itself via `src/cr3.rs`; invert or replace this
+/// test once upstream lands support (see issue #63).
 #[test]
 fn cr3_is_not_supported_by_upstream() {
 	match read_container(CR3) {
