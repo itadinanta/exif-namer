@@ -499,7 +499,7 @@ impl<'a> App<'a> {
 						);
 					}
 					Err(e) => {
-						error!("Unable to compute hash for {:?}: {}", &src, e);
+						error!("Unable to compute hash for {:?}: {}", src, e);
 						app_state.report_error();
 					}
 				}
@@ -595,7 +595,7 @@ impl<'a> App<'a> {
 	fn delete_empty_dir<P: AsRef<Path>>(&self, path_ref: P) -> bool {
 		let candidate_path = path_ref.as_ref();
 		if !self.args.dry_run {
-			debug!("Attempting to delete directory {:?}", &candidate_path);
+			debug!("Attempting to delete directory {:?}", candidate_path);
 			if let Ok(contains_files) = self.contains_files(candidate_path) {
 				if !contains_files {
 					if let Err(e) = fs::remove_dir(candidate_path) {
@@ -657,7 +657,7 @@ impl<'a> App<'a> {
 					let dest_path = PathBuf::from(dest);
 					self.apply_mode(app_state, self.args.mode, src_path, &dest_path, &data);
 				}
-				Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
+				Err(e) => error!("Invalid pattern or data {}: {}", self.args.destination, e),
 			}
 		}
 	}
