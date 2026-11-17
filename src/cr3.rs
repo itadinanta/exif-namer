@@ -117,7 +117,7 @@ mod tests {
 
 	fn fixture(name: &str) -> std::io::BufReader<File> {
 		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-			.join("tests/data")
+			.join(crate::FIXTURE_DIR)
 			.join(name);
 		std::io::BufReader::new(File::open(path).expect("fixture present"))
 	}

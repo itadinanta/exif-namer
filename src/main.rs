@@ -871,3 +871,153 @@ fn main() -> ExitCode {
 		ExitCode::SUCCESS
 	}
 }
+
+#[cfg(test)]
+/// Binary image fixtures, provenance and licensing in `tests/data/ATTRIBUTION.md`.
+const FIXTURE_DIR: &str = "tests/data";
+
+#[cfg(test)]
+mod info_tests {
+	use super::*;
+
+	struct InfoCase {
+		file: &'static str,
+		/// Selected `{{Key}}` -> formatted value pairs, exactly as `-m info`
+		/// renders them (sanitized, `{{SysTimestampFormat}}`-formatted).
+		expected: &'static [(&'static str, &'static str)],
+	}
+
+	/// One entry per image fixture in `tests/data`. Together the selections
+	/// cover JPEG/PNG/WebP/HEIF/TIFF sniffing, big- and little-endian TIFF,
+	/// thumbnail IFDs (`ExifTn*` keys), GPS fields, and Canon RAW via the
+	/// upstream TIFF reader and the `cr3` module.
+	static INFO_CASES: &[InfoCase] = &[
+		InfoCase {
+			file: "exif.jpg",
+			expected: &[
+				("ExifDateTime", "20160504_030201"),
+				("ExifImageDescription", "Test_image"),
+				("ExifTnJPEGInterchangeFormatLength", "648"),
+			],
+		},
+		InfoCase {
+			file: "exif.png",
+			expected: &[
+				("ExifImageDescription", "Test_image"),
+				("ExifSoftware", "implex_+_kamadak-exif"),
+			],
+		},
+		InfoCase {
+			file: "exif.webp",
+			expected: &[
+				("ExifImageDescription", "WebP_test"),
+				("ExifSoftware", "GIMP_+_implex_+_kamadak-exif"),
+			],
+		},
+		InfoCase {
+			file: "exif.heic",
+			expected: &[("ExifSoftware", "libheif_+_kamadak-exif")],
+		},
+		InfoCase {
+			file: "exif.tif",
+			expected: &[
+				("ExifImageDescription", "Test_image"),
+				("ExifTnImageDescription", "Test_thumbnail"),
+			],
+		},
+		InfoCase {
+			file: "yaminabe.tif",
+			expected: &[
+				("ExifOrientation", "1"),
+				("ExifGPSLatitude", "10_1"),
+				("ExifTagTiff65000", "-340282346638528860000000000000000000000"),
+			],
+		},
+		InfoCase {
+			file: "yaminale.tif",
+			expected: &[
+				("ExifOrientation", "1"),
+				("ExifGPSLatitude", "10_1"),
+				("ExifTagTiff65000", "-340282346638528860000000000000000000000"),
+			],
+		},
+		InfoCase {
+			file: "exif.cr2",
+			expected: &[
+				("ExifDateTimeOriginal", "20240815_010758"),
+				("ExifModel", "Canon_EOS_M"),
+			],
+		},
+		InfoCase {
+			file: "exif.cr3",
+			expected: &[
+				("ExifDateTimeOriginal", "20240617_233831"),
+				("ExifModel", "Canon_EOS_M50"),
+				("ExifExposureTime", "1_80"),
+			],
+		},
+	];
+
+	#[test]
+	fn app_generates_info_table_for_every_fixture() {
+		for case in INFO_CASES {
+			let src = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIR).join(case.file);
+			let args = Args::parse_from([
+				"exif-namer",
+				"-m",
+				"info",
+				"--no-sha1",
+				src.to_str().expect("utf-8 fixture path"),
+			]);
+			let app = App::new(args).unwrap_or_else(|e| panic!("{}: App::new failed: {e}", case.file));
+
+			// Same property extraction as `apply_matches` performs per file.
+			let mut app_state = AppState::default();
+			let mut data = Map::new();
+			data.insert(
+				prepend!(SYS_PREFIX, "Idx").to_string(),
+				Value::String("000000".to_string()),
+			);
+			app.extract_properties(&mut app_state, &src, |app_state, key, value| {
+				match app.attr_formatter.as_string(value) {
+					Ok(as_string) => {
+						data.insert(key.to_owned(), Value::String(as_string));
+					}
+					Err(e) => {
+						error!("{}: cannot convert property {key}: {e}", case.file);
+						app_state.report_error();
+					}
+				}
+			});
+
+			for (key, expected) in case.expected {
+				assert_eq!(
+					data.get(*key).and_then(Value::as_str),
+					Some(*expected),
+					"{}: property {key}",
+					case.file
+				);
+			}
+			for sys_key in ["SysName", "SysExt", "SysSize"] {
+				assert!(
+					data.contains_key(sys_key),
+					"{}: missing system property {sys_key}",
+					case.file
+				);
+			}
+
+			// Drive the actual `-m info` rendering path, then require a clean run.
+			let rendered = app
+				.handlebars
+				.render(DESTINATION_TEMPLATE_ID, &data)
+				.expect("destination template renders");
+			let dest = PathBuf::from(rendered);
+			app.apply_mode(&mut app_state, Mode::Info, &src, &dest, &data);
+			assert!(
+				!app_state.has_errors_or_warnings(),
+				"{}: -m info reported errors or warnings",
+				case.file
+			);
+		}
+	}
+}
