@@ -2,6 +2,7 @@ use chrono::{DateTime, Local, NaiveDateTime};
 use clap::builder::PossibleValue;
 use clap::{Parser, ValueEnum};
 use const_format::concatcp;
+use digest_io::IoWrapper;
 use exif::In;
 use glob::*;
 use handlebars::handlebars_helper;
@@ -536,17 +537,17 @@ impl<'a> App<'a> {
 		if !self.args.no_sha1 {
 			// File content - Sha1 properties
 			if let Ok(mut file) = fs::File::open(src) {
-				let mut hasher = Sha1::new();
+				let mut hasher = IoWrapper(Sha1::new());
 				match io::copy(&mut file, &mut hasher) {
 					Ok(_) => {
 						add_property(
 							app_state,
 							prepend!(SYS_PREFIX, "Sha1"),
-							&PropertyValue::Text(hex::encode(hasher.finalize())),
+							&PropertyValue::Text(hex::encode(hasher.0.finalize())),
 						);
 					}
 					Err(e) => {
-						error!("Unable to compute hash for {:?}: {}", &src, e);
+						error!("Unable to compute hash for {:?}: {}", src, e);
 						app_state.report_error();
 					}
 				}
@@ -652,7 +653,7 @@ impl<'a> App<'a> {
 	fn delete_empty_dir<P: AsRef<Path>>(&self, path_ref: P) -> bool {
 		let candidate_path = path_ref.as_ref();
 		if !self.args.dry_run {
-			debug!("Attempting to delete directory {:?}", &candidate_path);
+			debug!("Attempting to delete directory {:?}", candidate_path);
 			if let Ok(contains_files) = self.contains_files(candidate_path) {
 				if !contains_files {
 					if let Err(e) = fs::remove_dir(candidate_path) {
@@ -714,7 +715,7 @@ impl<'a> App<'a> {
 					let dest_path = PathBuf::from(dest);
 					self.apply_mode(app_state, self.args.mode, src_path, &dest_path, &data);
 				}
-				Err(e) => error!("Invalid pattern or data {}: {}", &self.args.destination, e),
+				Err(e) => error!("Invalid pattern or data {}: {}", self.args.destination, e),
 			}
 		}
 	}
