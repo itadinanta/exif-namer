@@ -133,7 +133,7 @@ mod tests {
 		let fields = read_fields(&mut fixture("exif.cr3")).expect("CR3 parses");
 		let found = fields
 			.iter()
-			.find(|f| f.tag == exif::Tag::DateTimeOriginal)
+			.find(|f| f.tag == Tag::DateTimeOriginal)
 			.expect("DateTimeOriginal present");
 		assert_eq!(found.display_value().to_string(), "2024-06-17 23:38:31");
 	}
@@ -141,7 +141,7 @@ mod tests {
 	#[test]
 	fn cr3_camera_identity_stays_in_tiff_context() {
 		let fields = read_fields(&mut fixture("exif.cr3")).expect("CR3 parses");
-		let make = fields.iter().find(|f| f.tag == exif::Tag::Make).expect("Make present");
+		let make = fields.iter().find(|f| f.tag == Tag::Make).expect("Make present");
 		assert_eq!(make.tag.0, Context::Tiff);
 		assert_eq!(make.display_value().to_string(), "\"Canon\"");
 	}
