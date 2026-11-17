@@ -692,7 +692,7 @@ impl<'a> App<'a> {
 		// for each file matching the current glob
 		for src_path in paths.iter() {
 			// extract properties as a String -> Value map
-			let mut data = serde_json::value::Map::new();
+			let mut data = Map::new();
 			data.insert(
 				prepend!(SYS_PREFIX, "Idx").to_string(),
 				Value::String(format!("{:01$}", idx_counter, self.args.idx_width)),
